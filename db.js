@@ -114,11 +114,16 @@ async function upsertClient(payload, scoringResult) {
     dob:                     personal.dob || null,
     sex:                     personal.sex,
     address:                 personal.address,
+    apt:                     personal.apt,
     city:                    personal.city,
     province:                personal.province,
     postal:                  personal.postal,
     employment_status:       employment?.source ?? employment?.employmentStatus,
     employer:                employment?.employer,
+    work_phone:              employment?.workPhone,
+    job_desc:                employment?.jobDesc,
+    hire_date:               employment?.hireDate || null,
+    paid_by:                 employment?.paidBy,
     pay_frequency:           employment?.payFrequency ?? employment?.payFreq,
     declared_monthly_income: personal?.declaredIncome ?? employment?.monthlyIncome ?? null,
     latest_tier:             scoringResult.tier,
@@ -185,9 +190,19 @@ async function saveAppRecord(payload, scoringResult, bankData, clientId) {
 
     employment_status:       employment?.source ?? employment?.employmentStatus,
     employer:                employment?.employer,
+    work_phone:              employment?.workPhone,
+    job_desc:                employment?.jobDesc,
+    supervisor:              employment?.supervisor,
+    hire_date:               employment?.hireDate || null,
+    ei_start_date:           employment?.eiStart || null,
+    paid_by:                 employment?.paidBy,
+    other_income_type:       employment?.otherIncome,
     pay_frequency:           employment?.payFrequency ?? employment?.payFreq,
     next_pay_date:           employment?.nextPay || null,
     declared_monthly_income: personal?.declaredIncome ?? employment?.monthlyIncome ?? null,
+
+    sex:                     personal?.sex,
+    apt:                     personal?.apt,
 
     flinks_login_id:   banking?.flinksLoginId,
     bank_name:         banking?.institution,
@@ -203,9 +218,11 @@ async function saveAppRecord(payload, scoringResult, bankData, clientId) {
     esig_name:      signature?.fullName,
     esig_timestamp: signature?.timestamp,
 
-    safety_contact_name:  sc ? `${sc.firstName || ''} ${sc.lastName || ''}`.trim() : null,
-    safety_contact_phone: sc?.phone,
-    safety_contact_rel:   sc?.relationship,
+    safety_contact_name:        sc ? `${sc.firstName || ''} ${sc.lastName || ''}`.trim() : null,
+    safety_contact_first_name:  sc?.firstName || null,
+    safety_contact_last_name:   sc?.lastName  || null,
+    safety_contact_phone:       sc?.phone,
+    safety_contact_rel:         sc?.relationship,
   };
 
   const { data, error } = await supabase
