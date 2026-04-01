@@ -33,8 +33,8 @@ const TIERS = [
   { name: 'red',    min: 90, max: 101, decision: 'auto_declined' },
 ];
 
-// Candidate amounts for Orange feasibility loop (descending)
-const FEASIBILITY_CANDIDATES = [800, 700, 600, 500, 400, 300, 200, 100];
+// Candidate amounts for feasibility loop (descending — highest revenue first)
+const FEASIBILITY_CANDIDATES = [1000, 900, 800, 700, 600, 500, 400, 300, 200, 100];
 
 // DTI threshold for feasibility check
 const FEASIBILITY_DTI_LIMIT = 0.75;
@@ -249,6 +249,16 @@ function score(bankData, declaredIncome, requestedAmount) {
   let approvedAmount = requestedAmount;
   let feasibleAmount = requestedAmount;
 
+  // Build full feasibility list for all tiers (highest revenue first)
+  // This tells the analyst every amount the borrower can afford
+  const feasibilityList = tier.name !== 'red'
+    ? FEASIBILITY_CANDIDATES.filter(c => {
+        const payment = calcBiweeklyPayment(c) * 2;
+        const dti = (bankData.fixedObligations + payment) / (bankData.verifiedIncome || 1);
+        return dti < FEASIBILITY_DTI_LIMIT;
+      })
+    : [];
+
   if (tier.name === 'red') {
     approvedAmount = 0;
     feasibleAmount = 0;
@@ -265,6 +275,7 @@ function score(bankData, declaredIncome, requestedAmount) {
         tier:           'red',
         decision:       'auto_declined',
         approvedAmount: 0,
+        feasibilityList: [],
         signals: buildSignals({
           bankData, declaredIncome, dtiRatio,
           nsf, opposition, dti, consistency, mismatch, balance,
@@ -293,6 +304,7 @@ function score(bankData, declaredIncome, requestedAmount) {
     decision:       tier.decision,
     approvedAmount,
     feasibleAmount: tier.name === 'orange' ? feasibleAmount : requestedAmount,
+    feasibilityList,   // full list of affordable amounts [$1000, $900, ...] for analyst
     signals:        buildSignals({
       bankData, declaredIncome, dtiRatio,
       nsf, opposition, dti, consistency, mismatch, balance,

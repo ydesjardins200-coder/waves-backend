@@ -178,8 +178,9 @@ async function saveAppRecord(payload, scoringResult, bankData, clientId) {
     tier:           scoringResult.tier,
     risk_score:     scoringResult.score,
     approved_amount: scoringResult.approvedAmount,
-    feasible_amount: scoringResult.feasibleAmount ?? scoringResult.approvedAmount,
-    hard_decline:   scoringResult.hardDecline,
+    feasible_amount:   scoringResult.feasibleAmount ?? scoringResult.approvedAmount,
+    feasibility_list:  scoringResult.feasibilityList ?? [],
+    hard_decline:      scoringResult.hardDecline,
     flags:          scoringResult.flags,
     signals:        scoringResult.signals,
 
