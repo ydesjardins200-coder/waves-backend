@@ -30,8 +30,11 @@ if (process.env.NODE_ENV !== 'production') {
 
 function setCORSHeaders(req, res) {
   const origin = req.headers['origin'];
-  if (origin && (ALLOWED_ORIGINS.includes(origin) || process.env.NODE_ENV !== 'production')) {
+  const allowAll = ALLOWED_ORIGINS.length === 0; // no list configured → open (dev mode)
+  if (origin && (allowAll || ALLOWED_ORIGINS.includes(origin) || process.env.NODE_ENV !== 'production')) {
     res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (allowAll) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
