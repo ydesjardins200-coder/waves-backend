@@ -300,17 +300,21 @@ async function handleRequest(req, res) {
 
     try {
       // 1. Load the application
+      console.log('[approve] Step 1 — loading application', applicationId);
       const { data: app, error: appErr } = await supabase
         .from('loan_applications').select('*').eq('id', applicationId).single();
-      if (appErr || !app) { sendJSON(res, 404, { error: 'Application not found' }); return; }
+      if (appErr || !app) { sendJSON(res, 404, { error: 'Application not found: ' + (appErr?.message||'null') }); return; }
+      console.log('[approve] App loaded:', app.ref, 'client:', app.client_id);
 
       // 2. Load the client
-      const { data: client } = await supabase
+      console.log('[approve] Step 2 — loading client', app.client_id);
+      const { data: client, error: clientErr } = await supabase
         .from('clients').select('*').eq('id', app.client_id).single();
-      if (!client) { sendJSON(res, 404, { error: 'Client not found' }); return; }
+      if (!client) { sendJSON(res, 404, { error: 'Client not found: ' + (clientErr?.message||'null') }); return; }
 
       // 3. Determine the approved amount (analyst may have overridden it)
       const approvedAmount = app.approved_amount || app.requested_amount;
+      console.log('[approve] Step 3 — approved amount:', approvedAmount);
       if (!approvedAmount || approvedAmount <= 0) {
         sendJSON(res, 400, { error: 'No valid approved amount on application' }); return;
       }
@@ -321,9 +325,10 @@ async function handleRequest(req, res) {
       const paymentAmt    = parseFloat(((approvedAmount * (1 + APR * TERM_DAYS / 365)) / PAYMENT_COUNT).toFixed(2));
       const totalRepayable = parseFloat((paymentAmt * PAYMENT_COUNT).toFixed(2));
 
+      console.log('[approve] Step 4 — checking for existing loan ref:', app.ref);
       // 4. Check if a loan record already exists for this application
       const { data: existingLoan } = await supabase
-        .from('loans').select('id, status').eq('ref', app.ref).single().catch(() => ({ data: null }));
+        .from('loans').select('id, status').eq('ref', app.ref).maybeSingle();
 
       let loanId;
 
@@ -343,7 +348,6 @@ async function handleRequest(req, res) {
         // Create a brand-new loan record
         const { data: newLoan, error: loanErr } = await supabase.from('loans').insert({
           client_id:         app.client_id,
-          application_id:    app.id,
           ref:               app.ref,
           type:              app.type || 'new',
           principal:         approvedAmount,
@@ -362,6 +366,7 @@ async function handleRequest(req, res) {
         loanId = newLoan.id;
       }
 
+      console.log('[approve] Step 5 — generating schedule, loanId:', loanId);
       // 5. Generate repayment schedule (delete old one first if exists)
       await supabase.from('repayment_schedule').delete().eq('loan_id', loanId);
 
@@ -392,12 +397,12 @@ async function handleRequest(req, res) {
       await supabase.from('repayment_schedule').insert(scheduleRows);
       await supabase.from('loans').update({ due_date: finalDate }).eq('id', loanId);
 
+      console.log('[approve] Step 6 — creating contract');
       // 6. Create / update contract
       await supabase.from('contracts').delete().eq('loan_id', loanId);
       await supabase.from('contracts').insert({
         loan_id:            loanId,
         client_id:          app.client_id,
-        application_id:     app.id,
         principal:          approvedAmount,
         apr:                APR,
         term_days:          TERM_DAYS,
@@ -418,6 +423,7 @@ async function handleRequest(req, res) {
         pad_institution:    app.bank_name,
       });
 
+      console.log('[approve] Step 7 — stamping application');
       // 7. Stamp the application as reviewed + approved
       const now = new Date().toISOString();
       await supabase.from('loan_applications').update({
@@ -427,31 +433,35 @@ async function handleRequest(req, res) {
         approved_amount: approvedAmount,
       }).eq('id', applicationId);
 
-      // 8. Save analyst note if provided
-      if (analystNote?.trim()) {
-        await supabase.from('application_notes').insert({
-          application_id: applicationId,
-          client_id:      app.client_id,
-          agent:          'analyst',
-          note:           analystNote.trim(),
-        });
-        // Also add a client-level note for the approval
-        await supabase.from('client_notes').insert({
-          client_id: app.client_id,
-          agent:     'analyst',
-          note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()}. ${analystNote.trim()}`,
-          context:   'approval',
-        });
-      } else {
-        // Auto-log the approval in client notes
-        await supabase.from('client_notes').insert({
-          client_id: app.client_id,
-          agent:     'system',
-          note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()} — pending disbursement.`,
-          context:   'approval',
-        });
+      console.log('[approve] Step 8 — saving notes');
+      // 8. Save analyst note if provided (non-fatal — tables may not exist yet)
+      try {
+        if (analystNote?.trim()) {
+          await supabase.from('application_notes').insert({
+            application_id: applicationId,
+            client_id:      app.client_id,
+            agent:          'analyst',
+            note:           analystNote.trim(),
+          });
+          await supabase.from('client_notes').insert({
+            client_id: app.client_id,
+            agent:     'analyst',
+            note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()}. ${analystNote.trim()}`,
+            context:   'approval',
+          });
+        } else {
+          await supabase.from('client_notes').insert({
+            client_id: app.client_id,
+            agent:     'system',
+            note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()} — pending disbursement.`,
+            context:   'approval',
+          });
+        }
+      } catch (noteErr) {
+        console.warn('[approve] Note write skipped (tables may not exist):', noteErr.message);
       }
 
+      console.log('[approve] Step 9 — updating client stats');
       // 9. Update client stats + latest tier
       const { count: appCount } = await supabase
         .from('loan_applications').select('id', { count: 'exact' }).eq('client_id', app.client_id);
@@ -509,21 +519,25 @@ async function handleRequest(req, res) {
         .eq('ref', app.ref)
         .eq('status', 'pending_disbursement');
 
-      // Log note
-      const noteText = analystNote?.trim() || `Loan ${app.ref} declined by analyst.`;
-      await supabase.from('client_notes').insert({
-        client_id: app.client_id,
-        agent:     'analyst',
-        note:      noteText,
-        context:   'decline',
-      });
-      if (analystNote?.trim()) {
-        await supabase.from('application_notes').insert({
-          application_id: applicationId,
-          client_id:      app.client_id,
-          agent:          'analyst',
-          note:           analystNote.trim(),
+      // Log note (non-fatal)
+      try {
+        const noteText = analystNote?.trim() || `Loan ${app.ref} declined by analyst.`;
+        await supabase.from('client_notes').insert({
+          client_id: app.client_id,
+          agent:     'analyst',
+          note:      noteText,
+          context:   'decline',
         });
+        if (analystNote?.trim()) {
+          await supabase.from('application_notes').insert({
+            application_id: applicationId,
+            client_id:      app.client_id,
+            agent:          'analyst',
+            note:           analystNote.trim(),
+          });
+        }
+      } catch (noteErr) {
+        console.warn('[decline] Note write skipped:', noteErr.message);
       }
 
       // Update client stats
