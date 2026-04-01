@@ -18,6 +18,7 @@
 const https = require('https');
 const { fetchBankData, fetchBankDataMock } = require('./flinksFetcher');
 const { score } = require('./scoringEngine');
+const { saveApplication } = require('./db');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -265,9 +266,13 @@ async function resolveApplication(applicationPayload) {
   // ── 3. Build CRM payload ─────────────────────────────────────────────
   const crmPayload = buildCRMPayload(applicationPayload, scoringResult, bankData);
 
-  // ── 4. POST to CRM (fire-and-forget — don't block the response) ──────
+  // ── 4a. Save to Supabase (fire-and-forget) ───────────────────────────
+  saveApplication(applicationPayload, scoringResult, bankData).catch(err => {
+    console.error('[decisionResolver] Supabase save failed:', err.message);
+  });
+
+  // ── 4b. POST to CRM if configured (fire-and-forget) ──────────────────
   postToCRM(crmPayload).catch(err => {
-    // Log but don't fail the response — applicant shouldn't see CRM errors
     console.error('[decisionResolver] CRM POST failed:', err.message);
   });
 
