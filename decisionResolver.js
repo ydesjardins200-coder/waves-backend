@@ -145,7 +145,7 @@ function buildCRMPayload(application, scoringResult, bankData) {
       status:       employment.employmentStatus ?? employment.source,
       employer:     employment.employer,
       payFrequency: employment.payFrequency ?? employment.payFreq,
-      nextPayDate:  employment.nextPay,
+      nextPayDate:  employment.nextPay ?? applicationPayload.loan?.nextPay,
       declaredMonthlyIncome: personal.declaredIncome ?? employment.monthlyIncome,
     },
 
