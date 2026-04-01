@@ -11,6 +11,13 @@
 
 const http    = require('http');
 const { resolveApplication } = require('./decisionResolver');
+const {
+  saveApplication,
+  updateClientStats,
+  createLoan,
+  createRepaymentSchedule,
+  createContract,
+} = require('./db');
 const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
 const { supabase } = require('./supabaseClient');
 
@@ -277,6 +284,260 @@ async function handleRequest(req, res) {
       res.end(pdf);
     } catch (err) {
       console.error('[pdf/bank-report] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/approve ──────────────────────────────────────────────────────
+  // Full approval flow: stamp application → update loan → generate schedule + contract → update client stats
+  if (req.method === 'POST' && req.url === '/api/approve') {
+    let body;
+    try { body = await readJSON(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { applicationId, analystNote } = body;
+    if (!applicationId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
+
+    try {
+      // 1. Load the application
+      const { data: app, error: appErr } = await supabase
+        .from('loan_applications').select('*').eq('id', applicationId).single();
+      if (appErr || !app) { sendJSON(res, 404, { error: 'Application not found' }); return; }
+
+      // 2. Load the client
+      const { data: client } = await supabase
+        .from('clients').select('*').eq('id', app.client_id).single();
+      if (!client) { sendJSON(res, 404, { error: 'Client not found' }); return; }
+
+      // 3. Determine the approved amount (analyst may have overridden it)
+      const approvedAmount = app.approved_amount || app.requested_amount;
+      if (!approvedAmount || approvedAmount <= 0) {
+        sendJSON(res, 400, { error: 'No valid approved amount on application' }); return;
+      }
+
+      const APR           = 0.23;
+      const TERM_DAYS     = 112;
+      const PAYMENT_COUNT = 8;
+      const paymentAmt    = parseFloat(((approvedAmount * (1 + APR * TERM_DAYS / 365)) / PAYMENT_COUNT).toFixed(2));
+      const totalRepayable = parseFloat((paymentAmt * PAYMENT_COUNT).toFixed(2));
+
+      // 4. Check if a loan record already exists for this application
+      const { data: existingLoan } = await supabase
+        .from('loans').select('id, status').eq('ref', app.ref).single().catch(() => ({ data: null }));
+
+      let loanId;
+
+      if (existingLoan) {
+        // Update the existing loan with approved amount + set to pending_disbursement
+        await supabase.from('loans').update({
+          status:            'pending_disbursement',
+          principal:         approvedAmount,
+          payment_amount:    paymentAmt,
+          total_repayable:   totalRepayable,
+          remaining_balance: totalRepayable,
+          total_paid:        0,
+          apr:               APR,
+        }).eq('id', existingLoan.id);
+        loanId = existingLoan.id;
+      } else {
+        // Create a brand-new loan record
+        const { data: newLoan, error: loanErr } = await supabase.from('loans').insert({
+          client_id:         app.client_id,
+          application_id:    app.id,
+          ref:               app.ref,
+          type:              app.type || 'new',
+          principal:         approvedAmount,
+          apr:               APR,
+          term_days:         TERM_DAYS,
+          payment_count:     PAYMENT_COUNT,
+          payment_frequency: app.pay_frequency || 'biweekly',
+          payment_amount:    paymentAmt,
+          total_repayable:   totalRepayable,
+          remaining_balance: totalRepayable,
+          total_paid:        0,
+          status:            'pending_disbursement',
+          fund_method:       app.fund_method,
+        }).select('id, ref, principal, payment_amount, total_repayable, payment_count').single();
+        if (loanErr) throw new Error('Loan create failed: ' + loanErr.message);
+        loanId = newLoan.id;
+      }
+
+      // 5. Generate repayment schedule (delete old one first if exists)
+      await supabase.from('repayment_schedule').delete().eq('loan_id', loanId);
+
+      const nextPay      = app.next_pay_date;
+      const BIWEEKLY     = 14;
+      const intervalDays = app.pay_frequency === 'weekly' ? 7
+        : app.pay_frequency === 'monthly' ? 30
+        : app.pay_frequency === 'semi-monthly' ? 15
+        : BIWEEKLY;
+
+      let d = nextPay ? new Date(nextPay) : new Date();
+      const today = new Date();
+      if (d <= today) d = new Date(today.getTime() + intervalDays * 86400000);
+
+      const scheduleRows = [];
+      for (let i = 0; i < PAYMENT_COUNT; i++) {
+        scheduleRows.push({
+          loan_id:          loanId,
+          client_id:        app.client_id,
+          payment_number:   i + 1,
+          due_date:         d.toISOString().slice(0, 10),
+          scheduled_amount: paymentAmt,
+          status:           'scheduled',
+        });
+        d = new Date(d.getTime() + intervalDays * 86400000);
+      }
+      const finalDate = scheduleRows[scheduleRows.length - 1].due_date;
+      await supabase.from('repayment_schedule').insert(scheduleRows);
+      await supabase.from('loans').update({ due_date: finalDate }).eq('id', loanId);
+
+      // 6. Create / update contract
+      await supabase.from('contracts').delete().eq('loan_id', loanId);
+      await supabase.from('contracts').insert({
+        loan_id:            loanId,
+        client_id:          app.client_id,
+        application_id:     app.id,
+        principal:          approvedAmount,
+        apr:                APR,
+        term_days:          TERM_DAYS,
+        payment_count:      PAYMENT_COUNT,
+        payment_amount:     paymentAmt,
+        total_repayable:    totalRepayable,
+        payment_frequency:  app.pay_frequency || 'biweekly',
+        first_payment_date: scheduleRows[0].due_date,
+        final_payment_date: finalDate,
+        fund_method:        app.fund_method,
+        borrower_name:      `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+        borrower_email:     client.email,
+        borrower_address:   [client.address, client.apt, client.city, client.province, client.postal].filter(Boolean).join(', '),
+        borrower_province:  client.province,
+        esig_name:          app.esig_name,
+        esig_timestamp:     app.esig_timestamp,
+        pad_authorized:     true,
+        pad_institution:    app.bank_name,
+      });
+
+      // 7. Stamp the application as reviewed + approved
+      const now = new Date().toISOString();
+      await supabase.from('loan_applications').update({
+        reviewed_at:     now,
+        reviewed_by:     'analyst',
+        final_decision:  'approved',
+        approved_amount: approvedAmount,
+      }).eq('id', applicationId);
+
+      // 8. Save analyst note if provided
+      if (analystNote?.trim()) {
+        await supabase.from('application_notes').insert({
+          application_id: applicationId,
+          client_id:      app.client_id,
+          agent:          'analyst',
+          note:           analystNote.trim(),
+        });
+        // Also add a client-level note for the approval
+        await supabase.from('client_notes').insert({
+          client_id: app.client_id,
+          agent:     'analyst',
+          note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()}. ${analystNote.trim()}`,
+          context:   'approval',
+        });
+      } else {
+        // Auto-log the approval in client notes
+        await supabase.from('client_notes').insert({
+          client_id: app.client_id,
+          agent:     'system',
+          note:      `Loan ${app.ref} approved for $${approvedAmount.toLocaleString()} — pending disbursement.`,
+          context:   'approval',
+        });
+      }
+
+      // 9. Update client stats + latest tier
+      const { count: appCount } = await supabase
+        .from('loan_applications').select('id', { count: 'exact' }).eq('client_id', app.client_id);
+      const { data: allLoans } = await supabase
+        .from('loans').select('principal, total_paid').eq('client_id', app.client_id);
+      await supabase.from('clients').update({
+        total_applications: appCount ?? 0,
+        total_loans:        allLoans?.length ?? 0,
+        total_borrowed:     allLoans?.reduce((s, l) => s + parseFloat(l.principal || 0), 0) ?? 0,
+        total_repaid:       allLoans?.reduce((s, l) => s + parseFloat(l.total_paid || 0), 0) ?? 0,
+        latest_tier:        app.tier,
+      }).eq('id', app.client_id);
+
+      console.log(`[approve] ${app.ref} approved — $${approvedAmount} — loan ${loanId}`);
+      sendJSON(res, 200, {
+        ok:              true,
+        loanId,
+        approvedAmount,
+        paymentAmount:   paymentAmt,
+        totalRepayable,
+        scheduleCount:   scheduleRows.length,
+        firstPayment:    scheduleRows[0].due_date,
+        finalPayment:    finalDate,
+      });
+    } catch (err) {
+      console.error('[approve] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/decline ──────────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/decline') {
+    let body;
+    try { body = await readJSON(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { applicationId, analystNote } = body;
+    if (!applicationId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
+
+    try {
+      const { data: app } = await supabase
+        .from('loan_applications').select('ref, client_id, tier').eq('id', applicationId).single();
+      if (!app) { sendJSON(res, 404, { error: 'Application not found' }); return; }
+
+      const now = new Date().toISOString();
+      await supabase.from('loan_applications').update({
+        reviewed_at:    now,
+        reviewed_by:    'analyst',
+        final_decision: 'declined',
+      }).eq('id', applicationId);
+
+      // Cancel the pending loan if one exists
+      await supabase.from('loans')
+        .update({ status: 'cancelled' })
+        .eq('ref', app.ref)
+        .eq('status', 'pending_disbursement');
+
+      // Log note
+      const noteText = analystNote?.trim() || `Loan ${app.ref} declined by analyst.`;
+      await supabase.from('client_notes').insert({
+        client_id: app.client_id,
+        agent:     'analyst',
+        note:      noteText,
+        context:   'decline',
+      });
+      if (analystNote?.trim()) {
+        await supabase.from('application_notes').insert({
+          application_id: applicationId,
+          client_id:      app.client_id,
+          agent:          'analyst',
+          note:           analystNote.trim(),
+        });
+      }
+
+      // Update client stats
+      const { count: appCount } = await supabase
+        .from('loan_applications').select('id', { count: 'exact' }).eq('client_id', app.client_id);
+      await supabase.from('clients').update({
+        total_applications: appCount ?? 0,
+        latest_tier:        app.tier,
+      }).eq('id', app.client_id);
+
+      console.log(`[decline] ${app.ref} declined`);
+      sendJSON(res, 200, { ok: true });
+    } catch (err) {
+      console.error('[decline] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;

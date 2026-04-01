@@ -436,4 +436,8 @@ module.exports = {
   getLoanContract,
   getApplicationByRef,
   sendMagicLink,
+  // approval flow
+  createLoan,
+  createRepaymentSchedule,
+  createContract,
 };
