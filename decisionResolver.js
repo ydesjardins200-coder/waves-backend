@@ -22,7 +22,11 @@ const { saveApplication } = require('./db');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-const CRM_ENDPOINT  = process.env.CRM_ENDPOINT;   // your REST POST URL
+const CRM_ENDPOINT  = (() => {
+  const v = process.env.CRM_ENDPOINT;
+  if (!v || v.includes('your-crm') || v.includes('placeholder') || v === 'null') return null;
+  return v;
+})();
 const CRM_API_KEY   = process.env.CRM_API_KEY;    // if your CRM requires auth
 const IS_SANDBOX    = process.env.NODE_ENV !== 'production';
 

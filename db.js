@@ -101,7 +101,7 @@ async function saveApplication(applicationPayload, scoringResult, bankData) {
 // ─── UPSERT CLIENT ────────────────────────────────────────────────────────────
 
 async function upsertClient(payload, scoringResult) {
-  const { personal, employment } = payload;
+  const { personal, employment, banking } = payload;
   const email = personal?.email?.toLowerCase().trim();
   if (!email) return null;
 
