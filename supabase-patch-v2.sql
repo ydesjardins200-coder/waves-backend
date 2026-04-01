@@ -28,3 +28,7 @@ alter table public.clients
 
 -- ─── Confirm ──────────────────────────────────────────────────────────────────
 select 'loan_applications columns added' as status;
+
+-- ─── clients: add notes column ────────────────────────────────────────────────
+alter table public.clients
+  add column if not exists notes text;

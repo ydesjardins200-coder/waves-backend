@@ -11,6 +11,8 @@
 
 const http    = require('http');
 const { resolveApplication } = require('./decisionResolver');
+const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
+const { supabase } = require('./supabaseClient');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -211,6 +213,71 @@ async function handleRequest(req, res) {
     } catch (err) {
       console.error(`[renewal] ${body.ref} pipeline error:`, err.message);
       sendJSON(res, 200, fallbackResponse(body.ref));
+    }
+    return;
+  }
+
+  // ── GET /api/pdf/contract/:loanId ──────────────────────────────────────────
+  if (req.method === 'GET' && req.url.startsWith('/api/pdf/contract/')) {
+    const loanId = req.url.split('/api/pdf/contract/')[1]?.split('?')[0];
+    if (!loanId) { sendJSON(res, 400, { error: 'loanId required' }); return; }
+
+    try {
+      // Fetch contract + schedule + client
+      const [contractRes, schedRes] = await Promise.all([
+        supabase.from('contracts').select('*, loans(ref, client_id)').eq('loan_id', loanId).single(),
+        supabase.from('repayment_schedule').select('*').eq('loan_id', loanId).order('payment_number'),
+      ]);
+      if (contractRes.error) { sendJSON(res, 404, { error: 'Contract not found' }); return; }
+
+      const contract = { ...contractRes.data, loan_ref: contractRes.data.loans?.ref };
+      const clientId = contractRes.data.loans?.client_id;
+      const clientRes = clientId
+        ? await supabase.from('clients').select('*').eq('id', clientId).single()
+        : { data: {} };
+
+      const pdf = await generateContractPDF(contract, clientRes.data || {}, schedRes.data || []);
+
+      const filename = `contract-${contract.loan_ref || loanId}.pdf`;
+      res.writeHead(200, {
+        'Content-Type':        'application/pdf',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      pdf.length,
+      });
+      res.end(pdf);
+    } catch (err) {
+      console.error('[pdf/contract] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/pdf/bank-report/:applicationId ─────────────────────────────────
+  if (req.method === 'GET' && req.url.startsWith('/api/pdf/bank-report/')) {
+    const appId = req.url.split('/api/pdf/bank-report/')[1]?.split('?')[0];
+    if (!appId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
+
+    try {
+      const appRes = await supabase.from('loan_applications').select('*').eq('id', appId).single();
+      if (appRes.error) { sendJSON(res, 404, { error: 'Application not found' }); return; }
+
+      const app = appRes.data;
+      const clientRes = app.client_id
+        ? await supabase.from('clients').select('*').eq('id', app.client_id).single()
+        : { data: {} };
+
+      const pdf = await generateBankReportPDF(app, clientRes.data || {});
+
+      const filename = `bank-report-${app.ref || appId}.pdf`;
+      res.writeHead(200, {
+        'Content-Type':        'application/pdf',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      pdf.length,
+      });
+      res.end(pdf);
+    } catch (err) {
+      console.error('[pdf/bank-report] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
     }
     return;
   }
