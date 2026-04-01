@@ -247,11 +247,35 @@ async function resolveApplication(applicationPayload) {
   // ── 1. Fetch bank data ───────────────────────────────────────────────
   let bankData;
   if (IS_SANDBOX || banking.sandbox) {
-    // In sandbox mode, derive a scenario from the flinksLoginId prefix
-    // (e.g. "sandbox-gold-abc123" → gold scenario)
-    const scenarioMatch = banking.flinksLoginId?.match(/sandbox-([a-z]+)-/);
-    const scenario = scenarioMatch ? scenarioMatch[1] : 'green';
-    bankData = fetchBankDataMock(scenario);
+    // loginId format: "sandbox-{tier}-{random}-{base64signals}"
+    // If base64 signals are present, use them directly (custom QA values)
+    // Otherwise fall back to the named tier scenario
+    const parts = (banking.flinksLoginId || '').split('-');
+    const tier  = parts[1] || 'green';
+
+    // Check for base64-encoded custom signals (4th segment onward joined back)
+    const encodedSignals = parts.slice(3).join('-');
+    if (encodedSignals) {
+      try {
+        const decoded = JSON.parse(Buffer.from(encodedSignals, 'base64').toString('utf8'));
+        bankData = {
+          verifiedIncome:   Number(decoded.verifiedIncome)   || 0,
+          fixedObligations: Number(decoded.fixedObligations) || 0,
+          nsfCount:         Number(decoded.nsfCount)         || 0,
+          oppositionCount:  Number(decoded.oppositionCount)  || 0,
+          accountAgeDays:   Number(decoded.accountAgeDays)   || 0,
+          avgDailyBalance:  Number(decoded.avgDailyBalance)  || 0,
+          incomeRegularity: decoded.incomeRegularity         || 'consistent',
+        };
+        console.log('[sandbox] Using custom signals from loginId:', JSON.stringify(bankData));
+      } catch (e) {
+        console.warn('[sandbox] Failed to decode signals, falling back to tier:', tier, e.message);
+        bankData = fetchBankDataMock(tier);
+      }
+    } else {
+      bankData = fetchBankDataMock(tier);
+      console.log('[sandbox] Using mock scenario:', tier);
+    }
   } else {
     bankData = await fetchBankData(banking.flinksLoginId);
   }
