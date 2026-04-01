@@ -20,6 +20,7 @@ const {
 } = require('./db');
 const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
 const { supabase } = require('./supabaseClient');
+const { generateDRD, nextBusinessDay } = require('./drdGenerator');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -552,6 +553,125 @@ async function handleRequest(req, res) {
       sendJSON(res, 200, { ok: true });
     } catch (err) {
       console.error('[decline] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/pending ────────────────────────────────────────────────────
+  // Returns JSON list of all pending_disbursement loans with banking coords
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/pending')) {
+    try {
+      const { data: loans, error } = await supabase
+        .from('loans')
+        .select('id, ref, principal, client_id, status, fund_method')
+        .eq('status', 'pending_disbursement')
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+
+      // Enrich with client + application banking coords
+      const enriched = [];
+      for (const loan of (loans || [])) {
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, email, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+
+        // Prefer application-level coords (most recent), fall back to client record
+        enriched.push({
+          loanId:              loan.id,
+          ref:                 loan.ref,
+          amount:              loan.principal,
+          fundMethod:          loan.fund_method,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim() || '—',
+          borrowerEmail:       client.email || '',
+          borrowerTransit:     app.bank_transit      || client.bank_transit      || null,
+          borrowerInstitution: app.bank_institution  || client.bank_institution  || null,
+          borrowerAccount:     app.bank_account      || client.bank_account      || null,
+          hasBankingCoords:    !!(app.bank_transit || client.bank_transit),
+        });
+      }
+
+      sendJSON(res, 200, {
+        count:      enriched.length,
+        effectiveDate: nextBusinessDay().toISOString().slice(0, 10),
+        loans:      enriched,
+      });
+    } catch (err) {
+      console.error('[eft/pending] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/drd ────────────────────────────────────────────────────────
+  // Generates and downloads a Desjardins DRD (CPA 005) file for all
+  // pending_disbursement loans. Optionally pass ?loanIds=id1,id2 to subset.
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/drd')) {
+    try {
+      const urlObj   = new URL(req.url, 'http://localhost');
+      const loanIds  = urlObj.searchParams.get('loanIds')?.split(',').filter(Boolean) || [];
+      const fileNum  = parseInt(urlObj.searchParams.get('fileNum') || '1');
+      const effDate  = urlObj.searchParams.get('effectiveDate')
+        ? new Date(urlObj.searchParams.get('effectiveDate'))
+        : nextBusinessDay();
+
+      // Load loans
+      let query = supabase
+        .from('loans')
+        .select('id, ref, principal, client_id, fund_method, status')
+        .eq('status', 'pending_disbursement')
+        .order('created_at', { ascending: true });
+
+      if (loanIds.length) query = query.in('id', loanIds);
+      const { data: loans, error } = await query;
+      if (error) throw error;
+      if (!loans || !loans.length) {
+        sendJSON(res, 200, { message: 'No pending loans found', content: null }); return;
+      }
+
+      // Enrich with banking coords
+      const drdLoans = [];
+      for (const loan of loans) {
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+        drdLoans.push({
+          ref:                 loan.ref,
+          amount:              loan.principal,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+          borrowerTransit:     app.bank_transit      || client.bank_transit,
+          borrowerInstitution: app.bank_institution  || client.bank_institution,
+          borrowerAccount:     app.bank_account      || client.bank_account,
+        });
+      }
+
+      const { filename, content, summary, errors } = generateDRD(drdLoans, { effectiveDate: effDate, fileNumber: fileNum });
+
+      if (!content) {
+        sendJSON(res, 400, { error: 'No valid loans — missing banking coordinates', errors }); return;
+      }
+
+      // Log any skipped loans
+      if (errors.length) console.warn('[eft/drd] Skipped loans:', errors);
+
+      const buf = Buffer.from(content, 'utf8');
+      res.writeHead(200, {
+        'Content-Type':        'text/plain; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      buf.length,
+        'X-DRD-Summary':       JSON.stringify(summary),
+      });
+      res.end(buf);
+      console.log(`[eft/drd] Generated ${filename} — ${summary.transactionCount} loans — $${summary.totalAmount}`);
+    } catch (err) {
+      console.error('[eft/drd] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;
