@@ -293,7 +293,7 @@ async function handleRequest(req, res) {
   // Full approval flow: stamp application → update loan → generate schedule + contract → update client stats
   if (req.method === 'POST' && req.url === '/api/approve') {
     let body;
-    try { body = await readJSON(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
 
     const { applicationId, analystNote } = body;
     if (!applicationId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
@@ -486,7 +486,7 @@ async function handleRequest(req, res) {
   // ── POST /api/decline ──────────────────────────────────────────────────────
   if (req.method === 'POST' && req.url === '/api/decline') {
     let body;
-    try { body = await readJSON(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
 
     const { applicationId, analystNote } = body;
     if (!applicationId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
