@@ -114,6 +114,29 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // Debug endpoint — test Supabase connection
+  if (req.method === 'GET' && req.url === '/debug') {
+    const { supabase } = require('./supabaseClient');
+    const result = {
+      supabase_url_set:     !!process.env.SUPABASE_URL,
+      supabase_key_set:     !!process.env.SUPABASE_API_KEY,
+      supabase_client:      !!supabase,
+      node_env:             process.env.NODE_ENV,
+      allowed_origins:      process.env.ALLOWED_ORIGINS || '(not set)',
+    };
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('applications').select('id').limit(1);
+        result.supabase_query = error ? ('ERROR: ' + error.message) : 'OK — table reachable';
+        result.row_count_sample = data ? data.length : 0;
+      } catch(e) {
+        result.supabase_query = 'EXCEPTION: ' + e.message;
+      }
+    }
+    sendJSON(res, 200, result);
+    return;
+  }
+
   // Health check
   if (req.method === 'GET' && req.url === '/health') {
     sendJSON(res, 200, {
