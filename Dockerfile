@@ -2,17 +2,12 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json ./
-
-# Install dependencies
+# Copy package files and install dependencies
+COPY package.json package-lock.json ./
 RUN npm install --production
 
-# Copy application files
-COPY server.js .
-COPY scoringEngine.js .
-COPY flinksFetcher.js .
-COPY decisionResolver.js .
+# Copy all application files
+COPY *.js ./
 
 # Don't run as root
 RUN addgroup -S waves && adduser -S waves -G waves
