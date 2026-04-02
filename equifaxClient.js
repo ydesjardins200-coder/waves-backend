@@ -176,12 +176,12 @@ async function fetchCreditReport({ firstName, lastName, dob, address, city, prov
 
   if (res.status !== 200 && res.status !== 201) {
     console.error('[equifax] Report error body:', res.body.slice(0, 500));
-    throw new Error(`Equifax report request failed: HTTP ${res.status}`);
+    throw new Error(`Equifax report HTTP ${res.status}: ${res.body.slice(0, 300)}`);
   }
 
   let report;
   try { report = JSON.parse(res.body); }
-  catch { throw new Error('Equifax report response not JSON'); }
+  catch { throw new Error('Equifax report response not JSON: ' + res.body.slice(0, 300)); }
 
   return parseCreditReport(report);
 }
