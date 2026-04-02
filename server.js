@@ -22,6 +22,7 @@ const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator')
 const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
+const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -1477,6 +1478,54 @@ async function handleRequest(req, res) {
     } catch (err) {
       console.error('[eft/clear] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/credit/report ─────────────────────────────────────────────────
+  // Fetches Equifax OneView credit report for a client.
+  // Called server-side only — credentials never exposed to browser.
+  // Body: { clientId } — we look up their info from Supabase
+  if (req.method === 'POST' && req.url === '/api/credit/report') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { clientId } = body;
+    if (!clientId) { sendJSON(res, 400, { error: 'clientId required' }); return; }
+
+    try {
+      // Load client from Supabase
+      const { data: client, error: clientErr } = await supabase
+        .from('clients').select('first_name, last_name, dob, address, city, province, postal').eq('id', clientId).single();
+      if (clientErr || !client) { sendJSON(res, 404, { error: 'Client not found' }); return; }
+
+      const report = await fetchCreditReport({
+        firstName: client.first_name,
+        lastName:  client.last_name,
+        dob:       client.dob,
+        address:   client.address,
+        city:      client.city,
+        province:  client.province,
+        postal:    client.postal,
+      });
+
+      sendJSON(res, 200, report);
+      console.log(`[credit] Report fetched for client ${clientId.slice(0,8)} — score: ${report.score}`);
+    } catch (err) {
+      console.error('[credit] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/credit/token-test ───────────────────────────────────────────────
+  // Quick health check — verifies Equifax credentials work by getting a token
+  if (req.method === 'GET' && req.url === '/api/credit/token-test') {
+    try {
+      const token = await getAccessToken();
+      sendJSON(res, 200, { ok: true, token: token.slice(0, 8) + '…', message: 'Equifax OAuth token obtained successfully' });
+    } catch (err) {
+      sendJSON(res, 500, { ok: false, error: err.message });
     }
     return;
   }
