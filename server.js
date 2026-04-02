@@ -48,7 +48,8 @@ function setCORSHeaders(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Filename, X-Confirmed-By');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-PAD-Summary, X-DRD-Summary, X-Retry-Summary');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
