@@ -88,7 +88,6 @@ async function getAccessToken() {
     EFX_TOKEN_URL,
     'https://api.equifax.com/v2/oauth/token',
     'https://api.equifax.com/oauth/token',
-    'https://api.equifax.com/v1/oauth/token',
   ].filter((v, i, a) => v && a.indexOf(v) === i); // dedupe
 
   let lastError = null;
