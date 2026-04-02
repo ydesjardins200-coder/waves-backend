@@ -21,6 +21,7 @@ const {
 const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
 const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
+const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -1009,6 +1010,179 @@ async function handleRequest(req, res) {
 
     } catch (err) {
       console.error('[eft/pad/generate] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/eft/returns ───────────────────────────────────────────────────
+  // Upload a Desjardins CPA 005 return file.
+  // Body: { content: "<file text>", filename: "RETURN_20260405.txt" }
+  // OR multipart — Content-Type: text/plain with raw file content in body.
+  if (req.method === 'POST' && req.url === '/api/eft/returns') {
+    let body;
+    try {
+      // Accept raw text body (file content) or JSON wrapper
+      const raw = await new Promise((resolve, reject) => {
+        let buf = '';
+        req.on('data', c => { buf += c; });
+        req.on('end',  () => resolve(buf));
+        req.on('error', reject);
+      });
+
+      const ct = req.headers['content-type'] || '';
+      if (ct.includes('application/json')) {
+        body = JSON.parse(raw);
+      } else {
+        // Raw file upload — plain text
+        body = { content: raw, filename: req.headers['x-filename'] || 'return-file.txt' };
+      }
+    } catch (e) {
+      sendJSON(res, 400, { error: 'Invalid body: ' + e.message }); return;
+    }
+
+    const { content, filename } = body;
+    if (!content || !content.trim()) {
+      sendJSON(res, 400, { error: 'File content is required' }); return;
+    }
+
+    try {
+      const summary = await processReturnFile(content, filename || 'return-file.txt');
+      sendJSON(res, 200, summary);
+    } catch (err) {
+      console.error('[eft/returns] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/retries/preview ───────────────────────────────────────────
+  // Returns all NSF payments whose retry date has arrived (ready to collect).
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/retries/preview')) {
+    try {
+      const queue = await getRetryQueue(new Date());
+
+      const enriched = [];
+      for (const row of queue) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        if (!loan) continue;
+
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, email, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+
+        enriched.push({
+          scheduleId:          row.id,
+          ref:                 loan.ref,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          retryDate:           row.retry_date,
+          retryCount:          row.retry_count,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+          borrowerEmail:       client.email || '',
+          borrowerTransit:     app.bank_transit     || client.bank_transit     || null,
+          borrowerInstitution: app.bank_institution || client.bank_institution || null,
+          borrowerAccount:     app.bank_account     || client.bank_account     || null,
+          hasBankingCoords:    !!(app.bank_transit  || client.bank_transit),
+        });
+      }
+
+      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      sendJSON(res, 200, {
+        count:       enriched.length,
+        totalAmount: total.toFixed(2),
+        payments:    enriched,
+      });
+    } catch (err) {
+      console.error('[eft/retries/preview] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/eft/retries/generate ─────────────────────────────────────────
+  // Generates a PAD retry file for NSF payments whose retry date has arrived.
+  // Body: { confirmedBy: 'analyst', fileNum: 1 }
+  // Same safety locks as /api/eft/pad/generate — stamps eft_retry_at before returning file.
+  if (req.method === 'POST' && req.url === '/api/eft/retries/generate') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { confirmedBy, fileNum = 1 } = body;
+    if (!confirmedBy || !confirmedBy.trim()) {
+      sendJSON(res, 400, { error: 'confirmedBy is required' }); return;
+    }
+
+    try {
+      const queue = await getRetryQueue(new Date());
+      if (!queue.length) {
+        sendJSON(res, 200, { message: 'No NSF retries due today', filename: null }); return;
+      }
+
+      const padPayments = [];
+      const rowIds      = [];
+
+      for (const row of queue) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        if (!loan) continue;
+
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+
+        padPayments.push({
+          ref:                 loan.ref,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          dueDate:             row.retry_date,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+          borrowerTransit:     app.bank_transit     || client.bank_transit,
+          borrowerInstitution: app.bank_institution || client.bank_institution,
+          borrowerAccount:     app.bank_account     || client.bank_account,
+        });
+        rowIds.push(row.id);
+      }
+
+      if (!padPayments.length) {
+        sendJSON(res, 400, { error: 'No valid retries — missing banking coordinates' }); return;
+      }
+
+      const { filename, content, summary, errors } = generatePAD(padPayments, { fileNumber: parseInt(fileNum) });
+      if (!content) {
+        sendJSON(res, 400, { error: 'File generation failed', errors }); return;
+      }
+
+      // Stamp BEFORE returning — same atomic lock as regular PAD
+      const stampedAt = new Date().toISOString();
+      const { error: stampErr } = await supabase
+        .from('repayment_schedule')
+        .update({ eft_retry_at: stampedAt, eft_retry_file: filename })
+        .in('id', rowIds);
+
+      if (stampErr) {
+        console.error('[eft/retries] STAMP FAILED — file NOT sent:', stampErr.message);
+        sendJSON(res, 500, { error: 'Stamp failed — file not sent to prevent duplicate', detail: stampErr.message }); return;
+      }
+
+      console.log(`[eft/retries] ✅ ${filename} — ${summary.transactionCount} retries — $${summary.totalAmount} — by ${confirmedBy}`);
+      const buf = Buffer.from(content, 'utf8');
+      res.writeHead(200, {
+        'Content-Type':        'text/plain; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      buf.length,
+        'X-Retry-Summary':     JSON.stringify({ ...summary, stampedAt, confirmedBy }),
+      });
+      res.end(buf);
+    } catch (err) {
+      console.error('[eft/retries/generate] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;
