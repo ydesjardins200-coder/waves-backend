@@ -76,30 +76,48 @@ async function getAccessToken() {
     scope:         EFX_SCOPE,
   }).toString();
 
-  const res = await httpsRequest(EFX_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type':  'application/x-www-form-urlencoded',
-      'Content-Length': Buffer.byteLength(body),
-      'Accept':        'application/json',
-    },
-  }, body);
+  // Try token URL from env first, then common Equifax patterns
+  const tokenUrls = [
+    EFX_TOKEN_URL,
+    'https://api.equifax.com/v2/oauth/token',
+    'https://api.equifax.com/oauth/token',
+    'https://api.equifax.com/v1/oauth/token',
+  ].filter((v, i, a) => v && a.indexOf(v) === i); // dedupe
 
-  if (res.status !== 200) {
-    console.error('[equifax] Token error:', res.status, res.body.slice(0, 300));
-    throw new Error(`Equifax token request failed: HTTP ${res.status}`);
+  let lastError = null;
+
+  for (const tokenUrl of tokenUrls) {
+    try {
+      const res = await httpsRequest(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type':   'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+          'Accept':         'application/json',
+        },
+      }, body);
+
+      console.log(`[equifax] Token attempt ${tokenUrl} → HTTP ${res.status} — ${res.body.slice(0, 200)}`);
+
+      if (res.status === 200) {
+        let parsed;
+        try { parsed = JSON.parse(res.body); }
+        catch { throw new Error('Token response not JSON: ' + res.body.slice(0, 200)); }
+
+        _cachedToken = parsed.access_token;
+        _tokenExpiry = Date.now() + 20 * 60 * 1000;
+        console.log(`[equifax] Token obtained from ${tokenUrl}`);
+        return _cachedToken;
+      }
+
+      lastError = new Error(`HTTP ${res.status} from ${tokenUrl} — ${res.body.slice(0, 300)}`);
+    } catch (err) {
+      lastError = err;
+      console.warn(`[equifax] Token URL failed: ${tokenUrl} — ${err.message}`);
+    }
   }
 
-  let parsed;
-  try { parsed = JSON.parse(res.body); }
-  catch { throw new Error('Equifax token response not JSON: ' + res.body.slice(0, 200)); }
-
-  _cachedToken = parsed.access_token;
-  // Cache for 20 minutes (tokens last 24 min)
-  _tokenExpiry = Date.now() + 20 * 60 * 1000;
-
-  console.log('[equifax] New token obtained, expires in 20min');
-  return _cachedToken;
+  throw lastError || new Error('All Equifax token URLs failed');
 }
 
 // ─── CREDIT REPORT REQUEST ────────────────────────────────────────────────────
