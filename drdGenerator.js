@@ -32,6 +32,15 @@ const CURRENCY           = 'CAD';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
+/** Normalize accented characters to ASCII for CPA 005 compliance */
+function toASCII(str) {
+  return String(str || '')
+    .normalize('NFD')                    // decompose accents: é → e + ́
+    .replace(/[\u0300-\u036f]/g, '')     // strip combining diacritics
+    .replace(/[^\x20-\x7E]/g, ' ')      // replace any remaining non-ASCII with space
+    .trim();
+}
+
 /** Pad string to length, truncating if needed */
 function padR(str, len) {
   return String(str || '').substring(0, len).padEnd(len, ' ');
@@ -87,8 +96,8 @@ function buildHeaderRecord(fileNum, date) {
     fileCreationNum(fileNum),         // 21-24 — File creation number
     julianDate(date),                 // 25-30 — Creation date
     padR('', 5),                      // 31-35 — Reserved
-    padR(ORIGINATOR_LONG, 30),        // 36-65 — Originator long name
-    padR(ORIGINATOR_SHORT, 15),       // 66-80 — Originator short name (last 15 of 40)
+    padR(toASCII(ORIGINATOR_LONG), 30),        // 36-65 — Originator long name
+    padR(toASCII(ORIGINATOR_SHORT), 15),       // 66-80 — Originator short name (last 15 of 40)
   ].join('').substring(0, 80);
 }
 
@@ -146,9 +155,9 @@ function buildCreditRecord(loan, effectiveDate) {
     padR(ref, 14),                                // 56-69 — Cross-reference (loan ref)
     padL(ORIGINATOR_INST, 3),                     // 70-72 — Originator institution
     padL(ORIGINATOR_TRANSIT, 5),                  // 73-77 — Originator transit
-    padR(ORIGINATOR_SHORT, 15),                   // 78-92 — Originator short name
-    padR(borrowerName, 30),                       // 93-122 — Payee (borrower) name
-    padR(ORIGINATOR_LONG.substring(0, 10), 10),   // 123-132 — Originator long name (first 10)
+    padR(toASCII(ORIGINATOR_SHORT), 15),          // 78-92 — Originator short name
+    padR(toASCII(borrowerName), 30),              // 93-122 — Payee (borrower) name
+    padR(toASCII(ORIGINATOR_LONG).substring(0, 10), 10), // 123-132 — Originator long name (first 10)
     padR('', 7),                                  // 133-139 — Reserved
     padR(ref, 15),                                // 140-154 — Cross-ref (repeat)
     padR(ORIGINATOR_ACCOUNT, 13),                 // 155-167 — Originator account
@@ -405,9 +414,9 @@ function buildDebitRecord(payment, effectiveDate) {
     padR(xref, 14),                               // 56-69 — Cross-reference
     padL(ORIGINATOR_INST, 3),                     // 70-72 — Originator institution
     padL(ORIGINATOR_TRANSIT, 5),                  // 73-77 — Originator transit
-    padR(ORIGINATOR_SHORT, 15),                   // 78-92 — Originator short name
-    padR(borrowerName, 30),                       // 93-122 — Payor (borrower) name
-    padR(ORIGINATOR_LONG.substring(0, 10), 10),   // 123-132 — Originator long name
+    padR(toASCII(ORIGINATOR_SHORT), 15),                   // 78-92 — Originator short name
+    padR(toASCII(borrowerName), 30),                       // 93-122 — Payor (borrower) name
+    padR(toASCII(ORIGINATOR_LONG).substring(0, 10), 10),   // 123-132 — Originator long name
     padR('', 7),                                  // 133-139 — Reserved
     padR(xref, 15),                               // 140-154 — Cross-ref (repeat)
     padR(ORIGINATOR_ACCOUNT, 13),                 // 155-167 — Destination (your) account
