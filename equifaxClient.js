@@ -20,9 +20,9 @@ const https = require('https');
 
 const EFX_CLIENT_ID     = process.env.EQUIFAX_CLIENT_ID;
 const EFX_CLIENT_SECRET = process.env.EQUIFAX_CLIENT_SECRET;
-const EFX_TOKEN_URL     = process.env.EQUIFAX_TOKEN_URL     || 'https://api.equifax.com/v2/oauth/token';
-const EFX_REPORT_URL    = process.env.EQUIFAX_REPORT_URL    || 'https://api.equifax.com/business/consumer-credit/v1/reports';
-const EFX_SCOPE         = process.env.EQUIFAX_SCOPE         || 'https://api.equifax.com/consumer-credit';
+const EFX_TOKEN_URL     = process.env.EQUIFAX_TOKEN_URL  || 'https://api.equifax.com/v2/oauth/token';
+const EFX_REPORT_URL    = process.env.EQUIFAX_REPORT_URL || 'https://api.equifax.com/business/oneview/consumer-credit/v1/report';
+const EFX_SCOPE         = process.env.EQUIFAX_SCOPE      || 'https://api.equifax.com/business/oneview/consumer-credit/v1';
 
 // Simple in-memory token cache (token expires in 24 min, we cache for 20)
 let _cachedToken = null;
