@@ -1273,6 +1273,210 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── GET /api/eft/clearable ─────────────────────────────────────────────────
+  // Returns all submitted PAD payments that have no return code and whose
+  // effective date was at least N days ago (default 5 — return window closed).
+  // These are safe to mark as paid.
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/clearable')) {
+    try {
+      const urlObj     = new URL(req.url, 'http://localhost');
+      const windowDays = parseInt(urlObj.searchParams.get('days') || '5');
+      const cutoff     = new Date();
+      cutoff.setDate(cutoff.getDate() - windowDays);
+      const cutoffStr  = cutoff.toISOString().slice(0, 10);
+
+      // Payments that were submitted, not returned, not already paid,
+      // and whose due_date is older than the return window
+      const { data: rows, error } = await supabase
+        .from('repayment_schedule')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, eft_submitted_at, eft_file, eft_retry_at, status, return_code')
+        .not('eft_submitted_at', 'is', null)  // was submitted
+        .is('return_code', null)              // no return = cleared
+        .not('status', 'eq', 'paid')          // not already marked paid
+        .not('status', 'eq', 'failed')        // not failed
+        .not('status', 'eq', 'cancelled')     // not cancelled
+        .lte('due_date', cutoffStr)           // return window has passed
+        .order('due_date', { ascending: true });
+
+      if (error) throw error;
+
+      const enriched = [];
+      for (const row of (rows || [])) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id, total_paid, total_repayable, principal').eq('id', row.loan_id).single();
+        if (!loan) continue;
+        const { data: client } = await supabase
+          .from('clients').select('first_name, last_name, email').eq('id', loan.client_id).single();
+        enriched.push({
+          scheduleId:    row.id,
+          loanId:        row.loan_id,
+          ref:           loan.ref,
+          paymentNumber: row.payment_number,
+          amount:        row.scheduled_amount,
+          dueDate:       row.due_date,
+          eftFile:       row.eft_retry_at ? row.eft_retry_file : row.eft_file,
+          wasRetry:      !!row.eft_retry_at,
+          borrowerName:  client ? `${client.first_name || ''} ${client.last_name || ''}`.trim() : '—',
+          totalPaid:     loan.total_paid,
+          totalRepayable: loan.total_repayable,
+        });
+      }
+
+      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      sendJSON(res, 200, {
+        count:          enriched.length,
+        totalAmount:    total.toFixed(2),
+        windowDays,
+        cutoffDate:     cutoffStr,
+        payments:       enriched,
+      });
+    } catch (err) {
+      console.error('[eft/clearable] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/eft/clear ────────────────────────────────────────────────────
+  // Marks submitted payments as paid, updates loan totals, detects paid-off loans.
+  // Body: { confirmedBy: 'analyst', scheduleIds: [...], days: 5 }
+  // If scheduleIds not provided, clears ALL clearable payments in the window.
+  if (req.method === 'POST' && req.url === '/api/eft/clear') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { confirmedBy, scheduleIds = [], days = 5 } = body;
+    if (!confirmedBy || !confirmedBy.trim()) {
+      sendJSON(res, 400, { error: 'confirmedBy is required' }); return;
+    }
+
+    try {
+      const cutoff    = new Date();
+      cutoff.setDate(cutoff.getDate() - parseInt(days));
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      // Load clearable rows
+      let query = supabase
+        .from('repayment_schedule')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, eft_file, eft_retry_at, eft_retry_file')
+        .not('eft_submitted_at', 'is', null)
+        .is('return_code', null)
+        .not('status', 'eq', 'paid')
+        .not('status', 'eq', 'failed')
+        .not('status', 'eq', 'cancelled')
+        .lte('due_date', cutoffStr);
+
+      if (scheduleIds.length) query = query.in('id', scheduleIds);
+      const { data: rows, error: fetchErr } = await query;
+      if (fetchErr) throw fetchErr;
+
+      if (!rows || !rows.length) {
+        sendJSON(res, 200, { message: 'No clearable payments found', cleared: 0 });
+        return;
+      }
+
+      const clearedAt = new Date().toISOString();
+      const results   = [];
+
+      // Group by loan for efficient total_paid updates
+      const byLoan = {};
+      for (const row of rows) {
+        if (!byLoan[row.loan_id]) byLoan[row.loan_id] = [];
+        byLoan[row.loan_id].push(row);
+      }
+
+      for (const [loanId, loanRows] of Object.entries(byLoan)) {
+        // Load current loan state
+        const { data: loan } = await supabase
+          .from('loans')
+          .select('id, ref, client_id, total_paid, total_repayable, payment_count, status')
+          .eq('id', loanId).single();
+        if (!loan) continue;
+
+        // Mark each schedule row as paid
+        const rowIds       = loanRows.map(r => r.id);
+        const amountCleared = loanRows.reduce((s, r) => s + parseFloat(r.scheduled_amount || 0), 0);
+
+        const { error: schedErr } = await supabase
+          .from('repayment_schedule')
+          .update({ status: 'paid', paid_at: clearedAt })
+          .in('id', rowIds);
+        if (schedErr) { console.error(`[eft/clear] Schedule update error ${loan.ref}:`, schedErr.message); continue; }
+
+        // Update loan total_paid + remaining_balance
+        const newTotalPaid       = parseFloat(loan.total_paid || 0) + amountCleared;
+        const newRemainingBalance = Math.max(0, parseFloat(loan.total_repayable || 0) - newTotalPaid);
+
+        // Check if loan is fully paid off
+        const allPaid = await supabase
+          .from('repayment_schedule')
+          .select('id', { count: 'exact' })
+          .eq('loan_id', loanId)
+          .not('status', 'eq', 'paid');
+        const isPaidOff = allPaid.count === 0;
+
+        const loanUpdate = {
+          total_paid:        newTotalPaid,
+          remaining_balance: newRemainingBalance,
+        };
+        if (isPaidOff) loanUpdate.status = 'paid_off';
+
+        await supabase.from('loans').update(loanUpdate).eq('id', loanId);
+
+        // Update client total_repaid
+        await supabase.from('clients')
+          .update({ total_repaid: supabase.rpc ? undefined : newTotalPaid })  // updated via updateClientStats
+          .eq('id', loan.client_id)
+          .catch(() => {});
+
+        // Log client note
+        const noteText = isPaidOff
+          ? `Loan ${loan.ref} fully paid off. All ${loan.payment_count} payments cleared. Total repaid: $${newTotalPaid.toFixed(2)}.`
+          : `${loanRows.length} payment(s) cleared for ${loan.ref}: $${amountCleared.toFixed(2)}. Total paid: $${newTotalPaid.toFixed(2)} / $${loan.total_repayable}.`;
+
+        await supabase.from('client_notes').insert({
+          client_id: loan.client_id,
+          agent:     'system',
+          note:      noteText,
+          context:   isPaidOff ? 'paid_off' : 'payment_cleared',
+        }).catch(e => console.warn('[eft/clear] note error:', e.message));
+
+        if (isPaidOff) {
+          console.log(`[eft/clear] 🎉 PAID OFF: ${loan.ref} — $${newTotalPaid.toFixed(2)} total repaid`);
+        }
+
+        results.push({
+          ref:              loan.ref,
+          paymentsCleared:  loanRows.length,
+          amountCleared:    amountCleared.toFixed(2),
+          newTotalPaid:     newTotalPaid.toFixed(2),
+          remainingBalance: newRemainingBalance.toFixed(2),
+          paidOff:          isPaidOff,
+        });
+      }
+
+      const totalCleared = results.reduce((s, r) => s + parseFloat(r.amountCleared), 0);
+      const paidOffLoans = results.filter(r => r.paidOff);
+
+      console.log(`[eft/clear] ✅ Cleared ${rows.length} payments — $${totalCleared.toFixed(2)} — ${paidOffLoans.length} loan(s) paid off — by ${confirmedBy}`);
+
+      sendJSON(res, 200, {
+        cleared:       rows.length,
+        totalCleared:  totalCleared.toFixed(2),
+        paidOffCount:  paidOffLoans.length,
+        paidOffLoans:  paidOffLoans.map(r => r.ref),
+        results,
+        clearedAt,
+        confirmedBy,
+      });
+
+    } catch (err) {
+      console.error('[eft/clear] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // 404 for everything else
   sendJSON(res, 404, { error: 'Not found' });
 }
