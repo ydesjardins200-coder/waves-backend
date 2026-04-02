@@ -206,13 +206,91 @@ async function handleRequest(req, res) {
     body.submittedAt = body.submittedAt || new Date().toISOString();
     body.type        = 'renewal';
 
+    // ── Normalize renewal payload to match new loan field shape ──────────
+    if (!body.personal) body.personal = {};
+
+    // Flatten address changes into personal
+    if (body.address) {
+      if (body.address.changed === 'yes' || body.address.changed === true) {
+        body.personal.address  = body.address.address  || body.personal.address;
+        body.personal.city     = body.address.city     || body.personal.city;
+        body.personal.province = body.address.province || body.personal.province;
+        body.personal.postal   = body.address.postal   || body.personal.postal;
+      }
+    }
+
+    // Normalize banking field names
+    if (body.banking) {
+      body.banking.transitNumber     = body.banking.transit     || body.banking.transitNumber;
+      body.banking.institutionNumber = body.banking.institution || body.banking.institutionNumber;
+      body.banking.accountNumber     = body.banking.account     || body.banking.accountNumber;
+      body.banking.institution       = body.banking.flinksInstitution || body.banking.institution;
+      body.banking.sandbox           = !!body.banking.sandbox;
+    }
+
+    // Normalize employment field names
+    if (body.employment) {
+      body.employment.source       = body.employment.source || body.employment.employmentStatus;
+      body.employment.payFrequency = body.employment.payFrequency || body.employment.payFreq;
+    }
+
+    // Look up existing client by email and inherit missing fields
+    if (body.personal?.email) {
+      try {
+        const { data: existingClient } = await supabase
+          .from('clients')
+          .select('*')
+          .eq('email', body.personal.email.toLowerCase().trim())
+          .single();
+
+        if (existingClient) {
+          console.log(`[renewal] Matched existing client ${existingClient.id.slice(0,8)} — ${existingClient.first_name} ${existingClient.last_name}`);
+          // Personal — inherit what renewal form doesn't collect
+          body.personal.apt              = body.personal.apt              || existingClient.apt;
+          body.personal.sin              = body.personal.sin              || existingClient.sin;
+          body.personal.sex              = body.personal.sex              || existingClient.sex;
+          body.personal.dob              = body.personal.dob              || existingClient.dob;
+          body.personal.cellPhone        = body.personal.cellPhone        || existingClient.cell_phone;
+          body.personal.homePhone        = body.personal.homePhone        || existingClient.home_phone;
+          body.personal.declaredIncome   = body.personal.declaredIncome   || existingClient.declared_monthly_income;
+          // Address — inherit if renewal didn't update it
+          if (!body.personal.address) {
+            body.personal.address  = existingClient.address;
+            body.personal.city     = existingClient.city;
+            body.personal.province = existingClient.province;
+            body.personal.postal   = existingClient.postal;
+          }
+          // Employment — inherit from client record if not on renewal form
+          if (!body.employment) body.employment = {};
+          body.employment.source       = body.employment.source    || existingClient.employment_status;
+          body.employment.employer     = body.employment.employer  || existingClient.employer;
+          body.employment.workPhone    = body.employment.workPhone || existingClient.work_phone;
+          body.employment.jobDesc      = body.employment.jobDesc   || existingClient.job_desc;
+          body.employment.hireDate     = body.employment.hireDate  || existingClient.hire_date;
+          body.employment.paidBy       = body.employment.paidBy    || existingClient.paid_by;
+          // Banking — inherit if renewal didn't update it
+          if (body.banking && !body.banking.transitNumber && existingClient.bank_transit) {
+            body.banking.transitNumber     = existingClient.bank_transit;
+            body.banking.institutionNumber = existingClient.bank_institution;
+            body.banking.accountNumber     = existingClient.bank_account;
+            body.banking.institution       = existingClient.bank_name || body.banking.institution;
+          }
+          body._existingClientId = existingClient.id;
+        } else {
+          console.log(`[renewal] No existing client for ${body.personal.email} — will create new`);
+        }
+      } catch (lookupErr) {
+        console.warn('[renewal] Client lookup skipped (non-fatal):', lookupErr.message);
+      }
+    }
+
     const errors = validatePayload(body, 'renewal');
     if (errors.length) {
       sendJSON(res, 422, { error: 'Validation failed', details: errors });
       return;
     }
 
-    console.log(`[renewal] ${body.ref} — ${body.personal.firstName} ${body.personal.lastName} — $${body.loan.amount}`);
+    console.log(`[renewal] ${body.ref} — ${body.personal.firstName} ${body.personal.lastName} — $${body.loan.amount}${body._existingClientId ? ' (existing client)' : ' (new client)'}`);
 
     try {
       const decision = await resolveApplication(body);
