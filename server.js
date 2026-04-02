@@ -1482,6 +1482,43 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── GET /api/credit/raw-test ─────────────────────────────────────────────────
+  // Returns raw Equifax sandbox response for debugging
+  if (req.method === 'GET' && req.url === '/api/credit/raw-test') {
+    try {
+      const { getAccessToken } = require('./equifaxClient');
+      const https = require('https');
+      const token = await getAccessToken();
+      const EFX_REPORT_URL = process.env.EQUIFAX_REPORT_URL || 'https://api.equifax.com/business/oneview/consumer-credit/v1/report';
+
+      const body = JSON.stringify({
+        consumers: {
+          name: [{ identifier: 'current', firstName: 'John', lastName: 'Smith' }],
+          addresses: [{ identifier: 'current', street: '123 Main St', city: 'Toronto', state: 'ON', zip: 'M5V1A1', countryCode: 'CA' }],
+        },
+      });
+
+      const url = new URL(EFX_REPORT_URL);
+      const result = await new Promise((resolve, reject) => {
+        const req2 = https.request({
+          hostname: url.hostname, path: url.pathname, port: 443, method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Accept': 'application/json' },
+        }, (res2) => {
+          let data = '';
+          res2.on('data', c => { data += c; });
+          res2.on('end', () => resolve({ status: res2.statusCode, body: data }));
+        });
+        req2.on('error', reject);
+        req2.write(body); req2.end();
+      });
+
+      sendJSON(res, 200, { status: result.status, url: EFX_REPORT_URL, rawBody: result.body.slice(0, 2000) });
+    } catch (err) {
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // ── POST /api/credit/report ─────────────────────────────────────────────────
   // Fetches Equifax OneView credit report for a client.
   // Called server-side only — credentials never exposed to browser.
