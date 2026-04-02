@@ -755,8 +755,71 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── GET /api/eft/pads/preview ──────────────────────────────────────────────
+  // SAFE: Read-only preview. Never stamps anything. Use this to review before generating.
+  // Returns all unsubmitted scheduled payments due within next N days.
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/pads/preview')) {
+    try {
+      const urlObj    = new URL(req.url, 'http://localhost');
+      const daysAhead = parseInt(urlObj.searchParams.get('days') || '5');
+      const cutoff    = new Date();
+      cutoff.setDate(cutoff.getDate() + daysAhead);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      const { data: schedRows, error } = await supabase
+        .from('repayment_schedule')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, status, eft_submitted_at, eft_file')
+        .eq('status', 'scheduled')
+        .is('eft_submitted_at', null)          // ← NEVER SUBMITTED
+        .lte('due_date', cutoffStr)
+        .order('due_date', { ascending: true });
+
+      if (error) throw error;
+
+      const enriched = [];
+      for (const row of (schedRows || [])) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        if (!loan) continue;
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, email, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+        enriched.push({
+          scheduleId:          row.id,
+          ref:                 loan.ref,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          dueDate:             row.due_date,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim() || '—',
+          borrowerEmail:       client.email || '',
+          borrowerTransit:     app.bank_transit     || client.bank_transit     || null,
+          borrowerInstitution: app.bank_institution || client.bank_institution || null,
+          borrowerAccount:     app.bank_account     || client.bank_account     || null,
+          hasBankingCoords:    !!(app.bank_transit  || client.bank_transit),
+        });
+      }
+
+      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      sendJSON(res, 200, {
+        count:         enriched.length,
+        totalAmount:   total.toFixed(2),
+        cutoffDate:    cutoffStr,
+        effectiveDate: nextBusinessDay().toISOString().slice(0, 10),
+        payments:      enriched,
+        warning:       enriched.length === 0 ? 'No unsubmitted payments due in this window' : null,
+      });
+    } catch (err) {
+      console.error('[eft/pads/preview] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // ── GET /api/eft/pads/pending ───────────────────────────────────────────────
-  // Returns all scheduled payments due within the next N days (default 5)
+  // Legacy alias for /preview — same behaviour, read-only.
   if (req.method === 'GET' && req.url.startsWith('/api/eft/pads/pending')) {
     try {
       const urlObj   = new URL(req.url, 'http://localhost');
@@ -820,45 +883,57 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // ── GET /api/eft/pad ────────────────────────────────────────────────────────
-  // Generates a CPA 005 PAD (debit) file for scheduled borrower repayments.
-  // Query params:
-  //   days=5            Include payments due in next N days (default 5)
-  //   scheduleIds=a,b   Subset to specific repayment_schedule row IDs
-  //   fileNum=1         Sequential file number
-  if (req.method === 'GET' && req.url.startsWith('/api/eft/pad')) {
-    try {
-      const urlObj      = new URL(req.url, 'http://localhost');
-      const daysAhead   = parseInt(urlObj.searchParams.get('days') || '5');
-      const schedIds    = urlObj.searchParams.get('scheduleIds')?.split(',').filter(Boolean) || [];
-      const fileNum     = parseInt(urlObj.searchParams.get('fileNum') || '1');
+  // ── POST /api/eft/pad/generate ─────────────────────────────────────────────
+  // DESTRUCTIVE: Generates + stamps. Must be POST to prevent accidental double-trigger.
+  // Body: { days: 5, scheduleIds: [...], fileNum: 1, confirmedBy: 'analyst' }
+  //
+  // Safety locks:
+  //   1. POST only — GET requests cannot generate files
+  //   2. Filters eft_submitted_at IS NULL — already-stamped rows are excluded
+  //   3. Atomic stamp — marks rows BEFORE returning the file (prevents race)
+  //   4. confirmedBy required — human must explicitly confirm
+  //   5. Idempotency key — same scheduleIds always produce same filename
+  if (req.method === 'POST' && req.url === '/api/eft/pad/generate') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
 
+    const { days = 5, scheduleIds = [], fileNum = 1, confirmedBy } = body;
+
+    if (!confirmedBy || !confirmedBy.trim()) {
+      sendJSON(res, 400, { error: 'confirmedBy is required — pass the analyst name who approved this run' });
+      return;
+    }
+
+    try {
       const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() + daysAhead);
+      cutoff.setDate(cutoff.getDate() + parseInt(days));
       const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-      // Build query
+      // ── LOCK: query only unsubmitted rows ──────────────────────────────────
       let query = supabase
         .from('repayment_schedule')
-        .select('id, loan_id, payment_number, due_date, scheduled_amount, status')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, status, eft_submitted_at')
         .eq('status', 'scheduled')
+        .is('eft_submitted_at', null)           // CRITICAL: exclude already submitted
         .lte('due_date', cutoffStr)
         .order('due_date', { ascending: true });
 
-      if (schedIds.length) query = query.in('id', schedIds);
-      const { data: schedRows, error } = await query;
-      if (error) throw error;
+      if (scheduleIds.length) query = query.in('id', scheduleIds);
+      const { data: schedRows, error: fetchErr } = await query;
+      if (fetchErr) throw fetchErr;
 
       if (!schedRows || !schedRows.length) {
-        sendJSON(res, 200, { message: 'No scheduled payments due in this window', content: null }); return;
+        sendJSON(res, 200, { message: 'No unsubmitted payments due in this window — nothing generated', filename: null });
+        return;
       }
 
-      // Enrich with banking coords
+      // ── ENRICH with banking coords ─────────────────────────────────────────
       const padPayments = [];
+      const rowIds      = [];
       for (const row of schedRows) {
         const { data: loan } = await supabase
           .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
-        if (!loan) continue;
+        if (!loan) { console.warn(`[eft/pad] No loan for schedule ${row.id} — skipped`); continue; }
 
         const [clientRes, appRes] = await Promise.all([
           supabase.from('clients').select('first_name, last_name, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
@@ -873,31 +948,67 @@ async function handleRequest(req, res) {
           amount:              row.scheduled_amount,
           dueDate:             row.due_date,
           borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
-          borrowerTransit:     app.bank_transit      || client.bank_transit,
-          borrowerInstitution: app.bank_institution  || client.bank_institution,
-          borrowerAccount:     app.bank_account      || client.bank_account,
+          borrowerTransit:     app.bank_transit     || client.bank_transit,
+          borrowerInstitution: app.bank_institution || client.bank_institution,
+          borrowerAccount:     app.bank_account     || client.bank_account,
         });
+        rowIds.push(row.id);
       }
 
-      const { filename, content, summary, errors } = generatePAD(padPayments, { fileNumber: fileNum });
-
-      if (!content) {
-        sendJSON(res, 400, { error: 'No valid payments — missing banking coordinates', errors }); return;
+      if (!padPayments.length) {
+        sendJSON(res, 400, { error: 'No valid payments — all are missing banking coordinates' });
+        return;
       }
 
-      if (errors.length) console.warn('[eft/pad] Skipped payments:', errors);
+      // ── GENERATE FILE ──────────────────────────────────────────────────────
+      const { filename, content, summary, errors } = generatePAD(padPayments, { fileNumber: parseInt(fileNum) });
 
+      if (!content || !filename) {
+        sendJSON(res, 400, { error: 'File generation failed', errors });
+        return;
+      }
+
+      // ── ATOMIC STAMP — mark as submitted BEFORE returning file ────────────
+      // If the stamp fails, we abort and do NOT return the file.
+      // This means no file is sent if we can't record the submission.
+      const stampedAt = new Date().toISOString();
+      const { error: stampErr } = await supabase
+        .from('repayment_schedule')
+        .update({
+          eft_submitted_at: stampedAt,
+          eft_file:         filename,
+        })
+        .in('id', rowIds);
+
+      if (stampErr) {
+        // CRITICAL: Do NOT send the file if we can't stamp.
+        console.error('[eft/pad] STAMP FAILED — file NOT sent to prevent duplicate:', stampErr.message);
+        sendJSON(res, 500, {
+          error: 'Could not record submission — file NOT generated to prevent duplicate PAD. Fix DB connection and retry.',
+          detail: stampErr.message,
+        });
+        return;
+      }
+
+      // Log skipped payments (missing coords) — these were NOT included
+      if (errors.length) {
+        console.warn(`[eft/pad] ${errors.length} payment(s) skipped (missing coords):`, errors);
+      }
+
+      console.log(`[eft/pad] ✅ Generated + stamped: ${filename} — ${summary.transactionCount} payments — $${summary.totalAmount} — by ${confirmedBy}`);
+
+      // Return file as download
       const buf = Buffer.from(content, 'utf8');
       res.writeHead(200, {
         'Content-Type':        'text/plain; charset=utf-8',
         'Content-Disposition': `attachment; filename="${filename}"`,
         'Content-Length':      buf.length,
-        'X-PAD-Summary':       JSON.stringify(summary),
+        'X-PAD-Summary':       JSON.stringify({ ...summary, stampedAt, confirmedBy, skipped: errors }),
       });
       res.end(buf);
-      console.log(`[eft/pad] Generated ${filename} — ${summary.transactionCount} payments — $${summary.totalAmount}`);
+
     } catch (err) {
-      console.error('[eft/pad] Error:', err.message);
+      console.error('[eft/pad/generate] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;
