@@ -1057,10 +1057,17 @@ async function handleRequest(req, res) {
   }
 
   // ── GET /api/eft/retries/preview ───────────────────────────────────────────
-  // Returns all NSF payments whose retry date has arrived (ready to collect).
+  // Returns all NSF payments whose retry date has arrived + outstanding NSF fees.
   if (req.method === 'GET' && req.url.startsWith('/api/eft/retries/preview')) {
     try {
-      const queue = await getRetryQueue(new Date());
+      const { payments: queue, nsfFees } = await getRetryQueue(new Date());
+
+      // Build a map of loanId → outstanding NSF fees for quick lookup
+      const feesByLoan = {};
+      for (const fee of nsfFees) {
+        if (!feesByLoan[fee.loan_id]) feesByLoan[fee.loan_id] = [];
+        feesByLoan[fee.loan_id].push(fee);
+      }
 
       const enriched = [];
       for (const row of queue) {
@@ -1074,28 +1081,55 @@ async function handleRequest(req, res) {
         ]);
         const client = clientRes.data || {};
         const app    = appRes.data    || {};
-
-        enriched.push({
-          scheduleId:          row.id,
-          ref:                 loan.ref,
-          paymentNumber:       row.payment_number,
-          amount:              row.scheduled_amount,
-          retryDate:           row.retry_date,
-          retryCount:          row.retry_count,
-          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
-          borrowerEmail:       client.email || '',
+        const coords = {
           borrowerTransit:     app.bank_transit     || client.bank_transit     || null,
           borrowerInstitution: app.bank_institution || client.bank_institution || null,
           borrowerAccount:     app.bank_account     || client.bank_account     || null,
           hasBankingCoords:    !!(app.bank_transit  || client.bank_transit),
+        };
+
+        // Payment retry record
+        enriched.push({
+          type:          'retry',
+          scheduleId:    row.id,
+          ref:           loan.ref,
+          paymentNumber: row.payment_number,
+          amount:        row.scheduled_amount,
+          retryDate:     row.retry_date,
+          retryCount:    row.retry_count,
+          borrowerName:  `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+          borrowerEmail: client.email || '',
+          ...coords,
         });
+
+        // NSF fee records for this loan (separate D record each)
+        for (const fee of (feesByLoan[loan.id] || [])) {
+          enriched.push({
+            type:          'nsf_fee',
+            feeId:         fee.id,
+            scheduleId:    fee.schedule_id,
+            ref:           loan.ref,
+            paymentNumber: row.payment_number,
+            amount:        fee.amount,
+            retryDate:     row.retry_date,
+            retryCount:    row.retry_count,
+            borrowerName:  `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+            borrowerEmail: client.email || '',
+            ...coords,
+          });
+        }
       }
 
-      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      const retryTotal = enriched.filter(p=>p.type==='retry').reduce((s,p)=>s+parseFloat(p.amount||0),0);
+      const feeTotal   = enriched.filter(p=>p.type==='nsf_fee').reduce((s,p)=>s+parseFloat(p.amount||0),0);
       sendJSON(res, 200, {
-        count:       enriched.length,
-        totalAmount: total.toFixed(2),
-        payments:    enriched,
+        count:        enriched.length,
+        retryCount:   enriched.filter(p=>p.type==='retry').length,
+        feeCount:     enriched.filter(p=>p.type==='nsf_fee').length,
+        retryTotal:   retryTotal.toFixed(2),
+        feeTotal:     feeTotal.toFixed(2),
+        totalAmount:  (retryTotal + feeTotal).toFixed(2),
+        payments:     enriched,
       });
     } catch (err) {
       console.error('[eft/retries/preview] Error:', err.message);
@@ -1105,9 +1139,8 @@ async function handleRequest(req, res) {
   }
 
   // ── POST /api/eft/retries/generate ─────────────────────────────────────────
-  // Generates a PAD retry file for NSF payments whose retry date has arrived.
-  // Body: { confirmedBy: 'analyst', fileNum: 1 }
-  // Same safety locks as /api/eft/pad/generate — stamps eft_retry_at before returning file.
+  // Generates a PAD retry file: one D record per missed payment + one D record
+  // per outstanding $45 NSF fee. Atomically stamps both before returning file.
   if (req.method === 'POST' && req.url === '/api/eft/retries/generate') {
     let body;
     try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
@@ -1118,41 +1151,75 @@ async function handleRequest(req, res) {
     }
 
     try {
-      const queue = await getRetryQueue(new Date());
-      if (!queue.length) {
-        sendJSON(res, 200, { message: 'No NSF retries due today', filename: null }); return;
+      const { payments: queue, nsfFees } = await getRetryQueue(new Date());
+      if (!queue.length && !nsfFees.length) {
+        sendJSON(res, 200, { message: 'No NSF retries or fees due today', filename: null }); return;
       }
 
-      const padPayments = [];
-      const rowIds      = [];
+      const padPayments  = [];   // D records for the file
+      const schedRowIds  = [];   // repayment_schedule IDs to stamp eft_retry_at
+      const feeIds       = [];   // nsf_fees IDs to stamp as collected
 
-      for (const row of queue) {
+      // Build a coords cache to avoid N duplicate lookups
+      const coordsCache  = {};
+      async function getCoords(loanId) {
+        if (coordsCache[loanId]) return coordsCache[loanId];
         const { data: loan } = await supabase
-          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
-        if (!loan) continue;
-
+          .from('loans').select('ref, client_id').eq('id', loanId).single();
+        if (!loan) return null;
         const [clientRes, appRes] = await Promise.all([
           supabase.from('clients').select('first_name, last_name, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
           supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
         ]);
         const client = clientRes.data || {};
         const app    = appRes.data    || {};
-
-        padPayments.push({
-          ref:                 loan.ref,
-          paymentNumber:       row.payment_number,
-          amount:              row.scheduled_amount,
-          dueDate:             row.retry_date,
+        coordsCache[loanId] = {
+          loanRef:             loan.ref,
           borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
           borrowerTransit:     app.bank_transit     || client.bank_transit,
           borrowerInstitution: app.bank_institution || client.bank_institution,
           borrowerAccount:     app.bank_account     || client.bank_account,
+        };
+        return coordsCache[loanId];
+      }
+
+      // ── 1. Payment retry records ─────────────────────────────────────────
+      for (const row of queue) {
+        const coords = await getCoords(row.loan_id);
+        if (!coords) { console.warn(`[eft/retries] No loan for schedule ${row.id} — skipped`); continue; }
+        padPayments.push({
+          ref:                 coords.loanRef,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          dueDate:             row.retry_date,
+          borrowerName:        coords.borrowerName,
+          borrowerTransit:     coords.borrowerTransit,
+          borrowerInstitution: coords.borrowerInstitution,
+          borrowerAccount:     coords.borrowerAccount,
         });
-        rowIds.push(row.id);
+        schedRowIds.push(row.id);
+      }
+
+      // ── 2. NSF fee records ($45 each — separate D record) ────────────────
+      for (const fee of nsfFees) {
+        const coords = await getCoords(fee.loan_id);
+        if (!coords) { console.warn(`[eft/retries] No loan for fee ${fee.id} — skipped`); continue; }
+        // Use a special payment number suffix to distinguish in xref: e.g. WF-843805-F01
+        padPayments.push({
+          ref:                 coords.loanRef,
+          paymentNumber:       `F${String(feeIds.length + 1).padStart(2, '0')}`, // F01, F02...
+          amount:              fee.amount,
+          dueDate:             new Date().toISOString().slice(0, 10),
+          borrowerName:        coords.borrowerName,
+          borrowerTransit:     coords.borrowerTransit,
+          borrowerInstitution: coords.borrowerInstitution,
+          borrowerAccount:     coords.borrowerAccount,
+        });
+        feeIds.push(fee.id);
       }
 
       if (!padPayments.length) {
-        sendJSON(res, 400, { error: 'No valid retries — missing banking coordinates' }); return;
+        sendJSON(res, 400, { error: 'No valid records — all missing banking coordinates' }); return;
       }
 
       const { filename, content, summary, errors } = generatePAD(padPayments, { fileNumber: parseInt(fileNum) });
@@ -1160,25 +1227,43 @@ async function handleRequest(req, res) {
         sendJSON(res, 400, { error: 'File generation failed', errors }); return;
       }
 
-      // Stamp BEFORE returning — same atomic lock as regular PAD
-      const stampedAt = new Date().toISOString();
-      const { error: stampErr } = await supabase
-        .from('repayment_schedule')
-        .update({ eft_retry_at: stampedAt, eft_retry_file: filename })
-        .in('id', rowIds);
+      // ── ATOMIC STAMP — both schedule rows AND fee rows before returning ──
+      const stampedAt  = new Date().toISOString();
+      const stampOps   = [];
+
+      if (schedRowIds.length) {
+        stampOps.push(
+          supabase.from('repayment_schedule')
+            .update({ eft_retry_at: stampedAt, eft_retry_file: filename })
+            .in('id', schedRowIds)
+        );
+      }
+      if (feeIds.length) {
+        stampOps.push(
+          supabase.from('nsf_fees')
+            .update({ status: 'collected', paid_at: stampedAt })
+            .in('id', feeIds)
+        );
+      }
+
+      const stampResults = await Promise.all(stampOps);
+      const stampErr = stampResults.find(r => r.error)?.error;
 
       if (stampErr) {
         console.error('[eft/retries] STAMP FAILED — file NOT sent:', stampErr.message);
         sendJSON(res, 500, { error: 'Stamp failed — file not sent to prevent duplicate', detail: stampErr.message }); return;
       }
 
-      console.log(`[eft/retries] ✅ ${filename} — ${summary.transactionCount} retries — $${summary.totalAmount} — by ${confirmedBy}`);
+      const retryAmt = queue.reduce((s,r)=>s+parseFloat(r.scheduled_amount||0),0);
+      const feeAmt   = nsfFees.reduce((s,f)=>s+parseFloat(f.amount||0),0);
+      console.log(`[eft/retries] ✅ ${filename} — ${schedRowIds.length} retries ($${retryAmt.toFixed(2)}) + ${feeIds.length} NSF fees ($${feeAmt.toFixed(2)}) = $${(retryAmt+feeAmt).toFixed(2)} — by ${confirmedBy}`);
+
       const buf = Buffer.from(content, 'utf8');
       res.writeHead(200, {
         'Content-Type':        'text/plain; charset=utf-8',
         'Content-Disposition': `attachment; filename="${filename}"`,
         'Content-Length':      buf.length,
-        'X-Retry-Summary':     JSON.stringify({ ...summary, stampedAt, confirmedBy }),
+        'X-Retry-Summary':     JSON.stringify({ ...summary, stampedAt, confirmedBy, retryCount: schedRowIds.length, feeCount: feeIds.length }),
       });
       res.end(buf);
     } catch (err) {

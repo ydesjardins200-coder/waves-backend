@@ -293,30 +293,41 @@ async function processReturnFile(content, filename = 'return-file.txt') {
 // ─── RETRY QUEUE BUILDER ──────────────────────────────────────────────────────
 
 /**
- * getRetryQueue(cutoffDate) → payments ready to retry
+ * getRetryQueue(cutoffDate) → { payments, nsfFees }
  *
- * Returns all NSF-returned payments whose retry_date has arrived,
- * that haven't yet been submitted to a retry PAD run.
- * The calling code can then pass these to generatePAD().
+ * Returns all NSF-returned payments whose retry_date has arrived (not yet retried),
+ * plus all outstanding NSF fees for the same loans (to collect in the same PAD run).
  */
 async function getRetryQueue(cutoffDate = new Date()) {
   const cutoffStr = toISO(cutoffDate);
 
-  const { data, error } = await supabase
+  const { data: payments, error: pmtErr } = await supabase
     .from('repayment_schedule')
     .select('id, loan_id, payment_number, due_date, retry_date, scheduled_amount, return_code, retry_count')
     .eq('status', 'missed')
-    .eq('return_code', '900')           // NSF only
-    .is('eft_retry_at', null)           // not yet retried
-    .lte('retry_date', cutoffStr)       // retry date has arrived
+    .eq('return_code', '900')
+    .is('eft_retry_at', null)
+    .lte('retry_date', cutoffStr)
     .order('retry_date', { ascending: true });
 
-  if (error) {
-    console.error('[returns] Retry queue error:', error.message);
-    return [];
+  if (pmtErr) {
+    console.error('[returns] Retry queue error:', pmtErr.message);
+    return { payments: [], nsfFees: [] };
   }
 
-  return data || [];
+  // Fetch outstanding NSF fees for the loans in this retry run
+  const loanIds = [...new Set((payments || []).map(p => p.loan_id))];
+  let nsfFees = [];
+  if (loanIds.length) {
+    const { data: fees } = await supabase
+      .from('nsf_fees')
+      .select('*')
+      .in('loan_id', loanIds)
+      .eq('status', 'outstanding');
+    nsfFees = fees || [];
+  }
+
+  return { payments: payments || [], nsfFees };
 }
 
 module.exports = { processReturnFile, parseReturnFile, getRetryQueue, RETURN_CODES, NSF_FEE_AMOUNT };
