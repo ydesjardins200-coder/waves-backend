@@ -20,7 +20,7 @@ const {
 } = require('./db');
 const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
 const { supabase } = require('./supabaseClient');
-const { generateDRD, nextBusinessDay } = require('./drdGenerator');
+const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -672,6 +672,154 @@ async function handleRequest(req, res) {
       console.log(`[eft/drd] Generated ${filename} — ${summary.transactionCount} loans — $${summary.totalAmount}`);
     } catch (err) {
       console.error('[eft/drd] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/pads/pending ───────────────────────────────────────────────
+  // Returns all scheduled payments due within the next N days (default 5)
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/pads/pending')) {
+    try {
+      const urlObj   = new URL(req.url, 'http://localhost');
+      const daysAhead = parseInt(urlObj.searchParams.get('days') || '5');
+      const cutoff    = new Date();
+      cutoff.setDate(cutoff.getDate() + daysAhead);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      // Load scheduled payments due on or before cutoff
+      const { data: schedRows, error } = await supabase
+        .from('repayment_schedule')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, status')
+        .eq('status', 'scheduled')
+        .lte('due_date', cutoffStr)
+        .order('due_date', { ascending: true });
+
+      if (error) throw error;
+
+      // Enrich each payment with client banking coords via the loan
+      const enriched = [];
+      for (const row of (schedRows || [])) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        if (!loan) continue;
+
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, email, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+
+        enriched.push({
+          scheduleId:          row.id,
+          loanId:              row.loan_id,
+          ref:                 loan.ref,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          dueDate:             row.due_date,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim() || '—',
+          borrowerEmail:       client.email || '',
+          borrowerTransit:     app.bank_transit      || client.bank_transit      || null,
+          borrowerInstitution: app.bank_institution  || client.bank_institution  || null,
+          borrowerAccount:     app.bank_account      || client.bank_account      || null,
+          hasBankingCoords:    !!(app.bank_transit || client.bank_transit),
+        });
+      }
+
+      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      sendJSON(res, 200, {
+        count:         enriched.length,
+        totalAmount:   total.toFixed(2),
+        cutoffDate:    cutoffStr,
+        effectiveDate: nextBusinessDay().toISOString().slice(0, 10),
+        payments:      enriched,
+      });
+    } catch (err) {
+      console.error('[eft/pads/pending] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/pad ────────────────────────────────────────────────────────
+  // Generates a CPA 005 PAD (debit) file for scheduled borrower repayments.
+  // Query params:
+  //   days=5            Include payments due in next N days (default 5)
+  //   scheduleIds=a,b   Subset to specific repayment_schedule row IDs
+  //   fileNum=1         Sequential file number
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/pad')) {
+    try {
+      const urlObj      = new URL(req.url, 'http://localhost');
+      const daysAhead   = parseInt(urlObj.searchParams.get('days') || '5');
+      const schedIds    = urlObj.searchParams.get('scheduleIds')?.split(',').filter(Boolean) || [];
+      const fileNum     = parseInt(urlObj.searchParams.get('fileNum') || '1');
+
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() + daysAhead);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      // Build query
+      let query = supabase
+        .from('repayment_schedule')
+        .select('id, loan_id, payment_number, due_date, scheduled_amount, status')
+        .eq('status', 'scheduled')
+        .lte('due_date', cutoffStr)
+        .order('due_date', { ascending: true });
+
+      if (schedIds.length) query = query.in('id', schedIds);
+      const { data: schedRows, error } = await query;
+      if (error) throw error;
+
+      if (!schedRows || !schedRows.length) {
+        sendJSON(res, 200, { message: 'No scheduled payments due in this window', content: null }); return;
+      }
+
+      // Enrich with banking coords
+      const padPayments = [];
+      for (const row of schedRows) {
+        const { data: loan } = await supabase
+          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        if (!loan) continue;
+
+        const [clientRes, appRes] = await Promise.all([
+          supabase.from('clients').select('first_name, last_name, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
+          supabase.from('loan_applications').select('bank_transit, bank_institution, bank_account').eq('ref', loan.ref).single(),
+        ]);
+        const client = clientRes.data || {};
+        const app    = appRes.data    || {};
+
+        padPayments.push({
+          ref:                 loan.ref,
+          paymentNumber:       row.payment_number,
+          amount:              row.scheduled_amount,
+          dueDate:             row.due_date,
+          borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim(),
+          borrowerTransit:     app.bank_transit      || client.bank_transit,
+          borrowerInstitution: app.bank_institution  || client.bank_institution,
+          borrowerAccount:     app.bank_account      || client.bank_account,
+        });
+      }
+
+      const { filename, content, summary, errors } = generatePAD(padPayments, { fileNumber: fileNum });
+
+      if (!content) {
+        sendJSON(res, 400, { error: 'No valid payments — missing banking coordinates', errors }); return;
+      }
+
+      if (errors.length) console.warn('[eft/pad] Skipped payments:', errors);
+
+      const buf = Buffer.from(content, 'utf8');
+      res.writeHead(200, {
+        'Content-Type':        'text/plain; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      buf.length,
+        'X-PAD-Summary':       JSON.stringify(summary),
+      });
+      res.end(buf);
+      console.log(`[eft/pad] Generated ${filename} — ${summary.transactionCount} payments — $${summary.totalAmount}`);
+    } catch (err) {
+      console.error('[eft/pad] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;

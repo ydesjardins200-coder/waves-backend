@@ -274,4 +274,151 @@ function nextBusinessDay(from = new Date()) {
   return d;
 }
 
-module.exports = { generateDRD, nextBusinessDay };
+/**
+ * Record Type Z — Trailer for a DEBIT-only file
+ * Total credit value = 0, total debit value = sum of all payments
+ */
+function buildTrailerDebit(fileNum, totalAmount, transactionCount) {
+  return [
+    'Z',
+    padL(ORIGINATOR_INST, 3),
+    padR('', 6),
+    padL(ORIGINATOR_ID, 10),
+    fileCreationNum(fileNum),
+    padL('0', 10),                    // Total credit value (none)
+    fmtAmount(totalAmount),           // Total debit value
+    padL('0', 8),                     // Credit count (none)
+    padL(transactionCount, 8),        // Debit count
+    padR('', 4),
+    padR('', 18),
+  ].join('').substring(0, 80);
+}
+
+/**
+ * generatePAD(payments, options) → { filename, content, summary, errors }
+ *
+ * Generates a CPA 005 PAD (Pre-Authorized Debit) file for borrower repayments.
+ *
+ * @param {Array} payments  Array of payment objects:
+ *   - ref                 string   Loan reference (WF-XXXXXX)
+ *   - paymentNumber       number   Payment # (1–8)
+ *   - amount              number   Payment amount in CAD
+ *   - dueDate             Date     Payment due date (used as effective date)
+ *   - borrowerName        string   Borrower full name
+ *   - borrowerTransit     string   5-digit transit
+ *   - borrowerInstitution string   3-digit institution
+ *   - borrowerAccount     string   Account number
+ *
+ * @param {Object} options
+ *   - effectiveDate       Date     Override effective date for all payments
+ *   - fileNumber          number   Sequential file number (default: 1)
+ */
+function generatePAD(payments, options = {}) {
+  const effectiveDate = options.effectiveDate || nextBusinessDay();
+  const fileNumber    = options.fileNumber || 1;
+  const creationDate  = new Date();
+
+  const records    = [];
+  const errors     = [];
+  const validPmts  = [];
+
+  for (const pmt of payments) {
+    try {
+      // Use payment's own due date as effective date unless overridden
+      const effDate = options.effectiveDate || (pmt.dueDate ? new Date(pmt.dueDate) : effectiveDate);
+      const record  = buildDebitRecord(pmt, effDate);
+      records.push(record);
+      validPmts.push(pmt);
+    } catch (err) {
+      errors.push({ ref: pmt.ref, paymentNumber: pmt.paymentNumber, error: err.message });
+    }
+  }
+
+  if (!validPmts.length) {
+    return { filename: null, content: null, summary: null, errors };
+  }
+
+  const totalAmount = validPmts.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+
+  const header  = buildHeaderRecord(fileNumber, creationDate);
+  const trailer = buildTrailerDebit(fileNumber, totalAmount, validPmts.length);
+
+  const content = [header, ...records, trailer].join('\r\n') + '\r\n';
+
+  const dateStr  = effectiveDate.toISOString().slice(0, 10).replace(/-/g, '');
+  const filename = `WAVES_PAD_${dateStr}_${fileNumber.toString().padStart(4, '0')}.txt`;
+
+  const summary = {
+    filename,
+    effectiveDate: effectiveDate.toISOString().slice(0, 10),
+    transactionCount: validPmts.length,
+    totalAmount: totalAmount.toFixed(2),
+    payments: validPmts.map(p => ({
+      ref:           p.ref,
+      paymentNumber: p.paymentNumber,
+      amount:        parseFloat(p.amount || 0).toFixed(2),
+      dueDate:       p.dueDate,
+      name:          p.borrowerName,
+    })),
+    errors,
+  };
+
+  return { filename, content, summary, errors };
+}
+
+/**
+ * Record Type D — Debit Transaction (PAD — borrower repayment)
+ * Same 240-char layout as credit, but:
+ *   - Record type = 'D'
+ *   - Transaction type = 430 (Pre-Authorized Debit)
+ *   - Borrower account is the SOURCE (money pulled from borrower)
+ *   - Originator account is the DESTINATION (your Desjardins account)
+ */
+function buildDebitRecord(payment, effectiveDate) {
+  const {
+    borrowerTransit,
+    borrowerInstitution,
+    borrowerAccount,
+    amount,
+    ref,
+    borrowerName,
+    paymentNumber,
+  } = payment;
+
+  if (!borrowerTransit || !borrowerInstitution || !borrowerAccount) {
+    throw new Error(`Payment ${ref} #${paymentNumber}: missing banking coordinates`);
+  }
+
+  // Cross-reference: loan ref + payment number (e.g. WF-123456-P03)
+  const xref = `${ref}-P${String(paymentNumber || 1).padStart(2, '0')}`;
+
+  const line = [
+    'D',                                          // 1 — Record type (Debit)
+    padL(borrowerInstitution, 3),                 // 2-4 — Borrower institution (SOURCE)
+    padL(borrowerTransit, 5),                     // 5-9 — Borrower transit
+    padR(borrowerAccount, 13),                    // 10-22 — Borrower account
+    '430',                                        // 23-25 — Pre-Authorized Debit
+    fmtAmount(amount),                            // 26-35 — Amount in cents
+    julianDate(effectiveDate),                    // 36-41 — Effective date
+    padR('', 4),                                  // 42-45 — Reserved
+    padL(ORIGINATOR_ID, 10),                      // 46-55 — Originator ID
+    padR(xref, 14),                               // 56-69 — Cross-reference
+    padL(ORIGINATOR_INST, 3),                     // 70-72 — Originator institution
+    padL(ORIGINATOR_TRANSIT, 5),                  // 73-77 — Originator transit
+    padR(ORIGINATOR_SHORT, 15),                   // 78-92 — Originator short name
+    padR(borrowerName, 30),                       // 93-122 — Payor (borrower) name
+    padR(ORIGINATOR_LONG.substring(0, 10), 10),   // 123-132 — Originator long name
+    padR('', 7),                                  // 133-139 — Reserved
+    padR(xref, 15),                               // 140-154 — Cross-ref (repeat)
+    padR(ORIGINATOR_ACCOUNT, 13),                 // 155-167 — Destination (your) account
+    padR('', 73),                                 // 168-240 — Padding
+  ].join('');
+
+  return [
+    line.substring(0, 80),
+    line.substring(80, 160),
+    line.substring(160, 240),
+  ].join('\r\n');
+}
+
+module.exports = { generateDRD, generatePAD, nextBusinessDay };
