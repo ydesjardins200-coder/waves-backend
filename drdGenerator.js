@@ -398,8 +398,12 @@ function buildDebitRecord(payment, effectiveDate) {
     throw new Error(`Payment ${ref} #${paymentNumber}: missing banking coordinates`);
   }
 
-  // Cross-reference: loan ref + payment number (e.g. WF-123456-P03)
-  const xref = `${ref}-P${String(paymentNumber || 1).padStart(2, '0')}`;
+  // Cross-reference: loan ref + payment number (e.g. WF-R-417391-P03)
+  // CPA 005 col 56-69 = 14 chars max. Col 140-154 = 15 chars.
+  // We build a 15-char full xref for the repeat field, and truncate to 14 for the primary.
+  const xrefFull = `${ref}-P${String(paymentNumber || 1).padStart(2, '0')}`;
+  // If xref > 14, shorten by stripping 'WF-' prefix: 'R-417391-P01' = 12 chars ✓
+  const xref14   = xrefFull.length > 14 ? xrefFull.replace(/^WF-/, '') : xrefFull;
 
   const line = [
     'D',                                          // 1 — Record type (Debit)
@@ -411,14 +415,14 @@ function buildDebitRecord(payment, effectiveDate) {
     julianDate(effectiveDate),                    // 36-41 — Effective date
     padR('', 4),                                  // 42-45 — Reserved
     padL(ORIGINATOR_ID, 10),                      // 46-55 — Originator ID
-    padR(xref, 14),                               // 56-69 — Cross-reference
+    padR(xref14, 14),                             // 56-69 — Cross-reference (14 chars max)
     padL(ORIGINATOR_INST, 3),                     // 70-72 — Originator institution
     padL(ORIGINATOR_TRANSIT, 5),                  // 73-77 — Originator transit
-    padR(toASCII(ORIGINATOR_SHORT), 15),                   // 78-92 — Originator short name
-    padR(toASCII(borrowerName), 30),                       // 93-122 — Payor (borrower) name
-    padR(toASCII(ORIGINATOR_LONG).substring(0, 10), 10),   // 123-132 — Originator long name
+    padR(toASCII(ORIGINATOR_SHORT), 15),          // 78-92 — Originator short name
+    padR(toASCII(borrowerName), 30),              // 93-122 — Payor (borrower) name
+    padR(toASCII(ORIGINATOR_LONG).substring(0, 10), 10), // 123-132 — Originator long name
     padR('', 7),                                  // 133-139 — Reserved
-    padR(xref, 15),                               // 140-154 — Cross-ref (repeat)
+    padR(xrefFull, 15),                           // 140-154 — Cross-ref full (15 chars)
     padR(ORIGINATOR_ACCOUNT, 13),                 // 155-167 — Destination (your) account
     padR('', 73),                                 // 168-240 — Padding
   ].join('');
