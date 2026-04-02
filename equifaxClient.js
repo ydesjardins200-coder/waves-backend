@@ -20,11 +20,12 @@ const https = require('https');
 
 const EFX_CLIENT_ID     = process.env.EQUIFAX_CLIENT_ID;
 const EFX_CLIENT_SECRET = process.env.EQUIFAX_CLIENT_SECRET;
+const EFX_STATIC_TOKEN  = process.env.EQUIFAX_STATIC_TOKEN;  // Sandbox: paste auto-generated token from portal
 const EFX_TOKEN_URL     = process.env.EQUIFAX_TOKEN_URL  || 'https://api.equifax.com/v2/oauth/token';
 const EFX_REPORT_URL    = process.env.EQUIFAX_REPORT_URL || 'https://api.equifax.com/business/oneview/consumer-credit/v1/report';
 const EFX_SCOPE         = process.env.EQUIFAX_SCOPE      || 'https://api.equifax.com/business/oneview/consumer-credit/v1';
 
-// Simple in-memory token cache (token expires in 24 min, we cache for 20)
+// OAuth token cache (production only)
 let _cachedToken = null;
 let _tokenExpiry = 0;
 
@@ -60,13 +61,19 @@ function httpsRequest(url, options, body) {
 // ─── TOKEN EXCHANGE ───────────────────────────────────────────────────────────
 
 async function getAccessToken() {
-  // Return cached token if still valid
+  // Sandbox mode: use static token from env var directly
+  if (EFX_STATIC_TOKEN) {
+    console.log('[equifax] Using static sandbox token');
+    return EFX_STATIC_TOKEN;
+  }
+
+  // Return cached OAuth token if still valid
   if (_cachedToken && Date.now() < _tokenExpiry) {
     return _cachedToken;
   }
 
   if (!EFX_CLIENT_ID || !EFX_CLIENT_SECRET) {
-    throw new Error('EQUIFAX_CLIENT_ID and EQUIFAX_CLIENT_SECRET env vars not set');
+    throw new Error('Set EQUIFAX_STATIC_TOKEN (sandbox) or EQUIFAX_CLIENT_ID + EQUIFAX_CLIENT_SECRET (production)');
   }
 
   const body = new URLSearchParams({

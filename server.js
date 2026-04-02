@@ -1519,11 +1519,17 @@ async function handleRequest(req, res) {
   }
 
   // ── GET /api/credit/token-test ───────────────────────────────────────────────
-  // Quick health check — verifies Equifax credentials work by getting a token
   if (req.method === 'GET' && req.url === '/api/credit/token-test') {
     try {
       const token = await getAccessToken();
-      sendJSON(res, 200, { ok: true, token: token.slice(0, 8) + '…', message: 'Equifax OAuth token obtained successfully' });
+      const mode  = process.env.EQUIFAX_STATIC_TOKEN ? 'sandbox-static' : 'oauth-client-credentials';
+      sendJSON(res, 200, {
+        ok:      true,
+        mode,
+        token:   token.slice(0, 8) + '…',
+        reportUrl: process.env.EQUIFAX_REPORT_URL || 'https://api.equifax.com/business/oneview/consumer-credit/v1/report',
+        message: `Equifax token ready (${mode})`,
+      });
     } catch (err) {
       sendJSON(res, 500, { ok: false, error: err.message });
     }
