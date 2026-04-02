@@ -1550,7 +1550,7 @@ async function handleRequest(req, res) {
       console.log(`[credit] Report fetched for client ${clientId.slice(0,8)} — score: ${report.score}`);
     } catch (err) {
       console.error('[credit] Error:', err.message);
-      sendJSON(res, 500, { error: err.message });
+      sendJSON(res, 500, { error: err.message, stack: err.stack?.split('\n').slice(0,3) });
     }
     return;
   }
