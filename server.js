@@ -1425,22 +1425,25 @@ async function handleRequest(req, res) {
         await supabase.from('loans').update(loanUpdate).eq('id', loanId);
 
         // Update client total_repaid
-        await supabase.from('clients')
-          .update({ total_repaid: supabase.rpc ? undefined : newTotalPaid })  // updated via updateClientStats
-          .eq('id', loan.client_id)
-          .catch(() => {});
+        try {
+          await supabase.from('clients')
+            .update({ total_repaid: newTotalPaid })
+            .eq('id', loan.client_id);
+        } catch(e) { /* non-fatal */ }
 
         // Log client note
         const noteText = isPaidOff
           ? `Loan ${loan.ref} fully paid off. All ${loan.payment_count} payments cleared. Total repaid: $${newTotalPaid.toFixed(2)}.`
           : `${loanRows.length} payment(s) cleared for ${loan.ref}: $${amountCleared.toFixed(2)}. Total paid: $${newTotalPaid.toFixed(2)} / $${loan.total_repayable}.`;
 
-        await supabase.from('client_notes').insert({
-          client_id: loan.client_id,
-          agent:     'system',
-          note:      noteText,
-          context:   isPaidOff ? 'paid_off' : 'payment_cleared',
-        }).catch(e => console.warn('[eft/clear] note error:', e.message));
+        try {
+          await supabase.from('client_notes').insert({
+            client_id: loan.client_id,
+            agent:     'system',
+            note:      noteText,
+            context:   isPaidOff ? 'paid_off' : 'payment_cleared',
+          });
+        } catch(e) { console.warn('[eft/clear] note error:', e.message); }
 
         if (isPaidOff) {
           console.log(`[eft/clear] 🎉 PAID OFF: ${loan.ref} — $${newTotalPaid.toFixed(2)} total repaid`);

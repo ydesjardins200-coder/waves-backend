@@ -244,24 +244,28 @@ async function processReturnFile(content, filename = 'return-file.txt') {
       else { summary.nsfFees++; summary.nsfTotal += NSF_FEE_AMOUNT; }
 
       // Log client note
-      await supabase.from('client_notes').insert({
-        client_id: loan.client_id,
-        agent:     'system',
-        note:      `NSF returned on ${loan.ref} payment #${schedRow.payment_number} ($${parseFloat(schedRow.scheduled_amount).toFixed(2)}). $${NSF_FEE_AMOUNT} fee charged. Retry scheduled: ${toISO(retryDate)}.`,
-        context:   'nsf',
-      }).catch(e => console.warn('[returns] client note error:', e.message));
+      try {
+        await supabase.from('client_notes').insert({
+          client_id: loan.client_id,
+          agent:     'system',
+          note:      `NSF returned on ${loan.ref} payment #${schedRow.payment_number} ($${parseFloat(schedRow.scheduled_amount).toFixed(2)}). $${NSF_FEE_AMOUNT} fee charged. Retry scheduled: ${toISO(retryDate)}.`,
+          context:   'nsf',
+        });
+      } catch(e) { console.warn('[returns] client note error:', e.message); }
 
       summary.retriesScheduled++;
       console.log(`[returns] NSF: ${loan.ref} P${schedRow.payment_number} — fee charged, retry ${toISO(retryDate)}`);
 
     } else if (codeInfo.status === 'failed' || codeInfo.status === 'cancelled') {
       // Non-NSF failure — log note, no retry
-      await supabase.from('client_notes').insert({
-        client_id: loan.client_id,
-        agent:     'system',
-        note:      `Payment returned on ${loan.ref} #${schedRow.payment_number}: ${codeInfo.reason} (code ${ret.returnCode}). Manual follow-up required.`,
-        context:   'return',
-      }).catch(e => console.warn('[returns] client note error:', e.message));
+      try {
+        await supabase.from('client_notes').insert({
+          client_id: loan.client_id,
+          agent:     'system',
+          note:      `Payment returned on ${loan.ref} #${schedRow.payment_number}: ${codeInfo.reason} (code ${ret.returnCode}). Manual follow-up required.`,
+          context:   'return',
+        });
+      } catch(e) { console.warn('[returns] client note error:', e.message); }
 
       console.log(`[returns] ${codeInfo.status.toUpperCase()}: ${loan.ref} P${schedRow.payment_number} — ${codeInfo.reason}`);
     }
