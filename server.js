@@ -880,6 +880,12 @@ async function handleRequest(req, res) {
 
     console.log(`[eft/drd/confirm] Confirming ${loanIds.length} loans:`, loanIds);
 
+    // Guard: supabase must be available
+    if (!supabase) {
+      sendJSON(res, 500, { error: 'Database not connected — check SUPABASE_URL and SUPABASE_API_KEY in Railway env vars' });
+      return;
+    }
+
     try {
       const now = new Date().toISOString();
 
