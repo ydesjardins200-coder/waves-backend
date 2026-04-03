@@ -24,6 +24,7 @@ const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
 const vopay = require('./vopayClient');
+const ibv   = require('./ibvClient');
 
 // ── PAYMENT PROCESSOR STATE ───────────────────────────────────────────────────
 // Persisted in memory — survives restarts via PAYMENT_PROCESSOR env var
@@ -1546,6 +1547,47 @@ async function handleRequest(req, res) {
       console.error('[eft/clear] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
+    return;
+  }
+
+  // ── GET /api/ibv/status ───────────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/ibv/status') {
+    sendJSON(res, 200, ibv.getStatus());
+    return;
+  }
+
+  // ── GET /api/ibv/embed-url ────────────────────────────────────────────────────
+  // Returns the iFrame URL for the active IBV provider
+  // Frontend calls this when rendering the bank connection step
+  if (req.method === 'GET' && req.url.startsWith('/api/ibv/embed-url')) {
+    try {
+      const urlParams = new URL('http://x' + req.url).searchParams;
+      const redirectUrl = urlParams.get('redirectUrl') || undefined;
+      const config = await ibv.getEmbedConfig({ redirectUrl });
+      sendJSON(res, 200, config);
+    } catch (err) {
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/ibv/provider/set ────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/ibv/provider/set') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { provider } = body;
+    if (!['flinks', 'vopay'].includes(provider)) {
+      sendJSON(res, 400, { error: 'provider must be flinks or vopay' }); return;
+    }
+    if (provider === 'vopay' && !ibv.isVoPayConfigured()) {
+      sendJSON(res, 400, { error: 'VoPay credentials not configured — add VOPAY_ACCOUNT_ID, VOPAY_API_KEY, VOPAY_API_SECRET to Railway env vars' }); return;
+    }
+    // IBV_PROVIDER is read from env — instruct admin to set it in Railway
+    sendJSON(res, 200, {
+      ok: true,
+      message: `Set IBV_PROVIDER=${provider} in Railway environment variables and redeploy to apply the change.`,
+      current: ibv.getProvider(),
+    });
     return;
   }
 
