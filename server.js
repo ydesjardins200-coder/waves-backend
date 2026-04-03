@@ -597,7 +597,7 @@ async function handleRequest(req, res) {
               agent:     'system',
               note:      `⚠️ KYC FLAG: ${kycResult.summary}. Loan ${app.ref} requires compliance review before disbursement.`,
               context:   'kyc_flag',
-            }).catch(() => {});
+            }).then(()=>{}, ()=>{});
           }
           console.log(`[approve] KYC ${app.ref} → ${kycResult.status}`);
         } catch (kycErr) {
@@ -655,7 +655,7 @@ async function handleRequest(req, res) {
             agent:     'system',
             note:      `VoPay disbursement failed for ${app.ref}: ${vpErr.message}. Loan remains pending_disbursement — retry via admin.`,
             context:   'vopay_error',
-          }).catch(() => {});
+          }).then(()=>{}, ()=>{});
         }
       }
 
@@ -903,10 +903,11 @@ async function handleRequest(req, res) {
       }
 
       // Try to stamp disbursed_at if the column exists
-      await supabase.from('loans')
-        .update({ disbursed_at: now })
-        .in('id', loanIds)
-        .catch(e => console.warn('[eft/drd/confirm] disbursed_at not set (column may not exist):', e.message));
+      try {
+        await supabase.from('loans').update({ disbursed_at: now }).in('id', loanIds);
+      } catch (e) {
+        console.warn('[eft/drd/confirm] disbursed_at not set:', e.message);
+      }
 
       // Write a client note for each loan
       for (const loan of (updated || [])) {
@@ -915,7 +916,7 @@ async function handleRequest(req, res) {
           agent:     confirmedBy || 'analyst',
           note:      `Loan ${loan.ref} ($${loan.principal}) disbursed via DRD — marked active. ${note}`.trim(),
           context:   'disbursement',
-        }).catch(() => {});
+        }).then(()=>{}, ()=>{});
       }
 
       const count = updated?.length || 0;
