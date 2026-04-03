@@ -923,8 +923,8 @@ async function handleRequest(req, res) {
   }
 
   // ── GET /api/eft/pads/preview ──────────────────────────────────────────────
-  // SAFE: Read-only preview. Never stamps anything. Use this to review before generating.
-  // Returns all unsubmitted scheduled payments due within next N days.
+  // SAFE: Read-only preview. Never stamps anything.
+  // Returns scheduled+failed payments due in next N days from ACTIVE loans only.
   if (req.method === 'GET' && req.url.startsWith('/api/eft/pads/preview')) {
     try {
       const urlObj    = new URL(req.url, 'http://localhost');
@@ -932,21 +932,30 @@ async function handleRequest(req, res) {
       const cutoff    = new Date();
       cutoff.setDate(cutoff.getDate() + daysAhead);
       const cutoffStr = cutoff.toISOString().slice(0, 10);
+      const today     = new Date().toISOString().slice(0, 10);
 
+      // Scope to active loans only
+      const { data: activeLoans } = await supabase.from('loans').select('id').eq('status', 'active');
+      const activeLoanIds = (activeLoans || []).map(l => l.id);
+      if (!activeLoanIds.length) {
+        sendJSON(res, 200, { count: 0, totalAmount: '0.00', cutoffDate: cutoffStr, payments: [], summary: {}, warning: 'No active loans' });
+        return;
+      }
+
+      // Include scheduled + failed (NSF retries need to go into next PAD)
+      // Exclude only paid / cancelled rows
       const { data: schedRows, error } = await supabase
         .from('repayment_schedule')
         .select('id, loan_id, payment_number, due_date, scheduled_amount, status, eft_submitted_at, eft_file')
-        .eq('status', 'scheduled')
-        .is('eft_submitted_at', null)          // ← NEVER SUBMITTED
+        .in('status', ['scheduled', 'failed'])
+        .in('loan_id', activeLoanIds)
         .lte('due_date', cutoffStr)
         .order('due_date', { ascending: true });
-
       if (error) throw error;
 
       const enriched = [];
       for (const row of (schedRows || [])) {
-        const { data: loan } = await supabase
-          .from('loans').select('ref, client_id').eq('id', row.loan_id).single();
+        const { data: loan } = await supabase.from('loans').select('ref, client_id').eq('id', row.loan_id).single();
         if (!loan) continue;
         const [clientRes, appRes] = await Promise.all([
           supabase.from('clients').select('first_name, last_name, email, bank_transit, bank_institution, bank_account').eq('id', loan.client_id).single(),
@@ -960,6 +969,10 @@ async function handleRequest(req, res) {
           paymentNumber:       row.payment_number,
           amount:              row.scheduled_amount,
           dueDate:             row.due_date,
+          status:              row.status,
+          alreadySubmitted:    !!row.eft_submitted_at,
+          isOverdue:           row.due_date < today,
+          eftFile:             row.eft_file || null,
           borrowerName:        `${client.first_name || ''} ${client.last_name || ''}`.trim() || '—',
           borrowerEmail:       client.email || '',
           borrowerTransit:     app.bank_transit     || client.bank_transit     || null,
@@ -969,14 +982,24 @@ async function handleRequest(req, res) {
         });
       }
 
-      const total = enriched.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      const includedInPAD = enriched.filter(p => !p.alreadySubmitted && p.hasBankingCoords);
+      const total         = includedInPAD.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      const summary = {
+        includedInPAD:    includedInPAD.length,
+        alreadySubmitted: enriched.filter(p => p.alreadySubmitted).length,
+        missingCoords:    enriched.filter(p => !p.hasBankingCoords).length,
+        failed:           enriched.filter(p => p.status === 'failed').length,
+        overdue:          enriched.filter(p => p.isOverdue).length,
+      };
+      const warn = enriched.length === 0
+        ? 'No payments due in this window'
+        : summary.missingCoords
+          ? `${summary.missingCoords} payment(s) missing banking coords — excluded from PAD`
+          : null;
       sendJSON(res, 200, {
-        count:         enriched.length,
-        totalAmount:   total.toFixed(2),
-        cutoffDate:    cutoffStr,
-        effectiveDate: nextBusinessDay().toISOString().slice(0, 10),
-        payments:      enriched,
-        warning:       enriched.length === 0 ? 'No unsubmitted payments due in this window' : null,
+        count: includedInPAD.length, totalAmount: total.toFixed(2),
+        cutoffDate: cutoffStr, effectiveDate: nextBusinessDay().toISOString().slice(0, 10),
+        payments: enriched, summary, warning: warn,
       });
     } catch (err) {
       console.error('[eft/pads/preview] Error:', err.message);
