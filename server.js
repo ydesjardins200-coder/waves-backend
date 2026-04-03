@@ -565,15 +565,75 @@ async function handleRequest(req, res) {
       }).eq('id', app.client_id);
 
       console.log(`[approve] ${app.ref} approved — $${approvedAmount} — loan ${loanId}`);
+
+      // ── STEP 10: AUTO-DISBURSE VIA VOPAY (if active) ─────────────────────────
+      let vopayDisburseTxId   = null;
+      let vopayDisburseStatus = null;
+
+      if (activeProcessor === 'vopay' && vopay.isConfigured()) {
+        console.log('[approve] Step 10 — disbursing via VoPay');
+        try {
+          // Grab banking coords — prefer app-level, fall back to client-level
+          const { data: appBanking } = await supabase
+            .from('loan_applications')
+            .select('bank_transit, bank_institution, bank_account')
+            .eq('id', applicationId).single();
+
+          const bankToken   = client.vopay_token   || null;
+          const transit     = appBanking?.bank_transit      || client.bank_transit;
+          const institution = appBanking?.bank_institution  || client.bank_institution;
+          const account     = appBanking?.bank_account      || client.bank_account;
+
+          const result = await vopay.disburse({
+            loanId:      loanId,
+            loanRef:     app.ref,
+            amount:      approvedAmount,
+            email:       client.email,
+            firstName:   client.first_name,
+            lastName:    client.last_name,
+            bankToken,
+            transit,
+            institution,
+            account,
+          });
+
+          vopayDisburseTxId   = result.TransactionID || result.EFTTransactionID || null;
+          vopayDisburseStatus = 'submitted';
+
+          // Store VoPay transaction ID on the loan
+          await supabase.from('loans').update({
+            vopay_disburse_tx_id:   vopayDisburseTxId,
+            vopay_disburse_status:  'submitted',
+            // Keep as pending_disbursement until webhook confirms
+          }).eq('id', loanId);
+
+          console.log(`[approve] VoPay disburse submitted — txId: ${vopayDisburseTxId}`);
+        } catch (vpErr) {
+          // Non-fatal — loan stays as pending_disbursement, admin can retry manually
+          console.error('[approve] VoPay disburse error (non-fatal):', vpErr.message);
+          vopayDisburseStatus = 'error: ' + vpErr.message;
+
+          await supabase.from('client_notes').insert({
+            client_id: app.client_id,
+            agent:     'system',
+            note:      `VoPay disbursement failed for ${app.ref}: ${vpErr.message}. Loan remains pending_disbursement — retry via admin.`,
+            context:   'vopay_error',
+          }).catch(() => {});
+        }
+      }
+
       sendJSON(res, 200, {
-        ok:              true,
+        ok:                  true,
         loanId,
         approvedAmount,
-        paymentAmount:   paymentAmt,
+        paymentAmount:       paymentAmt,
         totalRepayable,
-        scheduleCount:   scheduleRows.length,
-        firstPayment:    scheduleRows[0].due_date,
-        finalPayment:    finalDate,
+        scheduleCount:       scheduleRows.length,
+        firstPayment:        scheduleRows[0].due_date,
+        finalPayment:        finalDate,
+        processor:           activeProcessor,
+        vopayDisburseTxId,
+        vopayDisburseStatus,
       });
     } catch (err) {
       console.error('[approve] Error:', err.message);
@@ -1519,7 +1579,7 @@ async function handleRequest(req, res) {
   }
 
   // ── POST /api/vopay/webhook ───────────────────────────────────────────────────
-  // VoPay posts return/NSF notifications here — same effect as importing a return file
+  // VoPay posts all transaction status updates here
   if (req.method === 'POST' && req.url === '/api/vopay/webhook') {
     let body;
     try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid body' }); return; }
@@ -1527,47 +1587,241 @@ async function handleRequest(req, res) {
     const event = vopay.parseWebhook(body);
     console.log(`[vopay webhook] ${event.type} — ${event.status} — ref: ${event.ref} — txId: ${event.txId}`);
 
-    if (event.isReturned || event.isNSF) {
-      // Match to repayment_schedule by ClientReferenceNumber (loanRef-P{paymentNum})
-      const refParts = event.ref.split('-P');
-      const loanRef  = refParts[0];
+    try {
+      // ── DISBURSEMENT CONFIRMED → flip loan to active ────────────────────────
+      if ((event.type === 'EFTWithdraw' || event.type === 'InteracETransfer') && event.isCompleted) {
+        const { data: loan } = await supabase
+          .from('loans').select('id,ref,client_id')
+          .eq('vopay_disburse_tx_id', event.txId).maybeSingle();
 
-      if (loanRef) {
-        try {
-          // Find the loan
-          const { data: loan } = await supabase.from('loans').select('id,client_id').eq('ref', loanRef).single();
-          if (loan) {
-            // Update schedule row — mark as failed
-            await supabase.from('repayment_schedule')
-              .update({
-                status:        'failed',
-                return_code:   event.returnCode,
-                return_reason: event.returnMsg || event.status,
-                returned_at:   new Date().toISOString(),
-              })
-              .eq('loan_id', loan.id)
-              .eq('status',  'scheduled');
+        if (loan) {
+          await supabase.from('loans').update({
+            status:                 'active',
+            vopay_disburse_status:  'completed',
+          }).eq('id', loan.id);
 
-            // Charge NSF fee if actual NSF
-            if (event.isNSF) {
-              await supabase.from('nsf_fees').insert({
-                client_id: loan.client_id,
-                loan_id:   loan.id,
-                amount:    45.00,
-                reason:    event.returnMsg || 'NSF via VoPay webhook',
-                return_code: event.returnCode,
-                status:    'outstanding',
-              });
-              console.log(`[vopay webhook] NSF fee charged for loan ${loanRef}`);
-            }
-          }
-        } catch (err) {
-          console.error('[vopay webhook] DB update error:', err.message);
+          await supabase.from('client_notes').insert({
+            client_id: loan.client_id,
+            agent:     'system',
+            note:      `Loan ${loan.ref} disbursement confirmed by VoPay (txId: ${event.txId}). Loan is now active.`,
+            context:   'vopay_disburse',
+          });
+          console.log(`[vopay webhook] Loan ${loan.ref} activated — disbursement confirmed`);
         }
       }
+
+      // ── DISBURSEMENT FAILED → log note, keep pending ────────────────────────
+      if ((event.type === 'EFTWithdraw' || event.type === 'InteracETransfer') && event.isReturned) {
+        const { data: loan } = await supabase
+          .from('loans').select('id,ref,client_id')
+          .eq('vopay_disburse_tx_id', event.txId).maybeSingle();
+
+        if (loan) {
+          await supabase.from('loans').update({
+            vopay_disburse_status: 'failed: ' + (event.returnMsg || event.returnCode),
+          }).eq('id', loan.id);
+
+          await supabase.from('client_notes').insert({
+            client_id: loan.client_id,
+            agent:     'system',
+            note:      `VoPay disbursement FAILED for ${loan.ref} — ${event.returnMsg||event.returnCode} (txId: ${event.txId}). Loan remains pending_disbursement.`,
+            context:   'vopay_error',
+          });
+          console.error(`[vopay webhook] Disbursement failed for loan ${loan.ref}: ${event.returnMsg}`);
+        }
+      }
+
+      // ── PAYMENT COLLECTED → mark schedule row as paid ──────────────────────
+      if (event.type === 'EFTFund' && event.isCompleted && event.ref) {
+        const { data: schedRow } = await supabase
+          .from('repayment_schedule').select('id,loan_id,scheduled_amount,payment_number')
+          .eq('vopay_tx_id', event.txId).maybeSingle();
+
+        if (schedRow) {
+          const now = new Date().toISOString();
+          await supabase.from('repayment_schedule').update({
+            status:  'paid',
+            paid_at: now,
+          }).eq('id', schedRow.id);
+
+          // Update loan totals
+          const { data: loan } = await supabase
+            .from('loans').select('total_paid,total_repayable,remaining_balance').eq('id', schedRow.loan_id).single();
+          if (loan) {
+            const newPaid   = parseFloat(loan.total_paid || 0) + parseFloat(schedRow.scheduled_amount);
+            const newRemain = Math.max(0, parseFloat(loan.remaining_balance || 0) - parseFloat(schedRow.scheduled_amount));
+            const paidOff   = newRemain <= 0.01;
+            await supabase.from('loans').update({
+              total_paid:        newPaid,
+              remaining_balance: newRemain,
+              ...(paidOff ? { status: 'paid_off' } : {}),
+            }).eq('id', schedRow.loan_id);
+            console.log(`[vopay webhook] Payment collected — loan ${schedRow.loan_id} P${schedRow.payment_number} — ${paidOff ? 'PAID OFF' : 'active'}`);
+          }
+        }
+      }
+
+      // ── PAYMENT RETURNED / NSF ──────────────────────────────────────────────
+      if (event.type === 'EFTFund' && (event.isReturned || event.isNSF)) {
+        const refParts = event.ref.split('-P');
+        const loanRef  = refParts[0];
+
+        if (loanRef) {
+          const { data: loan } = await supabase
+            .from('loans').select('id,client_id').eq('ref', loanRef).maybeSingle();
+
+          if (loan) {
+            // Mark the specific schedule row as failed
+            let schedQuery = supabase.from('repayment_schedule')
+              .update({ status: 'failed', return_code: event.returnCode, return_reason: event.returnMsg, returned_at: new Date().toISOString() });
+
+            if (event.txId) {
+              schedQuery = schedQuery.eq('vopay_tx_id', event.txId);
+            } else {
+              schedQuery = schedQuery.eq('loan_id', loan.id).eq('status', 'scheduled');
+            }
+            await schedQuery;
+
+            // Charge NSF fee
+            if (event.isNSF) {
+              await supabase.from('nsf_fees').insert({
+                client_id:   loan.client_id,
+                loan_id:     loan.id,
+                amount:      45.00,
+                reason:      event.returnMsg || 'NSF via VoPay',
+                return_code: event.returnCode,
+                status:      'outstanding',
+              });
+              console.log(`[vopay webhook] NSF charged — loan ${loanRef}`);
+            }
+          }
+        }
+      }
+
+    } catch (err) {
+      console.error('[vopay webhook] Processing error:', err.message);
     }
 
     sendJSON(res, 200, { ok: true, received: event });
+    return;
+  }
+
+  // ── POST /api/vopay/collect-today ─────────────────────────────────────────────
+  // Cron endpoint — collect all payments due today via VoPay
+  // Call daily: GET https://web-production-31ce.up.railway.app/api/vopay/collect-today
+  if (req.method === 'POST' && req.url === '/api/vopay/collect-today') {
+    if (!vopay.isConfigured()) {
+      sendJSON(res, 400, { error: 'VoPay not configured' }); return;
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    console.log(`[vopay cron] Collecting payments due ${today}`);
+
+    try {
+      // Load all scheduled payments due today
+      const { data: dueSched, error: schedErr } = await supabase
+        .from('repayment_schedule')
+        .select('*, loans(id,ref,client_id,payment_amount), clients(first_name,last_name,email,bank_transit,bank_institution,bank_account,vopay_token)')
+        .eq('status', 'scheduled')
+        .eq('due_date', today)
+        .is('vopay_tx_id', null); // not already submitted
+
+      if (schedErr) throw new Error(schedErr.message);
+      if (!dueSched?.length) {
+        sendJSON(res, 200, { ok: true, collected: 0, message: 'No payments due today' });
+        return;
+      }
+
+      const results = [];
+      for (const row of dueSched) {
+        const loan   = row.loans;
+        const client = row.clients;
+        if (!loan || !client) { results.push({ id: row.id, error: 'Missing loan/client' }); continue; }
+
+        try {
+          const result = await vopay.collect({
+            paymentId:   row.payment_number,
+            loanRef:     loan.ref,
+            amount:      parseFloat(row.scheduled_amount),
+            firstName:   client.first_name,
+            lastName:    client.last_name,
+            bankToken:   client.vopay_token,
+            transit:     client.bank_transit,
+            institution: client.bank_institution,
+            account:     client.bank_account,
+            dueDate:     today,
+          });
+
+          const txId = result.TransactionID || result.EFTTransactionID;
+
+          // Stamp the schedule row with VoPay tx ID
+          await supabase.from('repayment_schedule').update({
+            vopay_tx_id:       txId,
+            vopay_submitted_at: new Date().toISOString(),
+          }).eq('id', row.id);
+
+          results.push({ id: row.id, loanRef: loan.ref, txId, status: 'submitted' });
+          console.log(`[vopay cron] Submitted ${loan.ref} P${row.payment_number} — txId: ${txId}`);
+        } catch (err) {
+          results.push({ id: row.id, loanRef: loan.ref, error: err.message });
+          console.error(`[vopay cron] Failed ${loan.ref} P${row.payment_number}:`, err.message);
+        }
+      }
+
+      const submitted = results.filter(r => r.txId).length;
+      const failed    = results.filter(r => r.error).length;
+      console.log(`[vopay cron] Done — ${submitted} submitted, ${failed} failed`);
+      sendJSON(res, 200, { ok: true, date: today, submitted, failed, results });
+    } catch (err) {
+      console.error('[vopay cron] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/vopay/disburse/:loanId ─────────────────────────────────────────
+  // Manual VoPay disburse trigger from admin — for pending_disbursement loans
+  if (req.method === 'POST' && req.url.startsWith('/api/vopay/disburse/')) {
+    const loanId = req.url.split('/api/vopay/disburse/')[1];
+    if (!loanId) { sendJSON(res, 400, { error: 'loanId required' }); return; }
+    if (!vopay.isConfigured()) { sendJSON(res, 400, { error: 'VoPay not configured' }); return; }
+
+    try {
+      const { data: loan } = await supabase
+        .from('loans').select('*').eq('id', loanId).single();
+      if (!loan) { sendJSON(res, 404, { error: 'Loan not found' }); return; }
+      if (loan.status !== 'pending_disbursement') {
+        sendJSON(res, 400, { error: `Loan status is ${loan.status} — can only disburse pending_disbursement loans` }); return;
+      }
+
+      const { data: client } = await supabase
+        .from('clients').select('*').eq('id', loan.client_id).single();
+      const { data: appBanking } = await supabase
+        .from('loan_applications').select('bank_transit,bank_institution,bank_account').eq('ref', loan.ref).maybeSingle();
+
+      const result = await vopay.disburse({
+        loanId:      loan.id,
+        loanRef:     loan.ref,
+        amount:      parseFloat(loan.principal),
+        email:       client.email,
+        firstName:   client.first_name,
+        lastName:    client.last_name,
+        bankToken:   client.vopay_token,
+        transit:     appBanking?.bank_transit      || client.bank_transit,
+        institution: appBanking?.bank_institution  || client.bank_institution,
+        account:     appBanking?.bank_account      || client.bank_account,
+      });
+
+      const txId = result.TransactionID || result.EFTTransactionID;
+      await supabase.from('loans').update({
+        vopay_disburse_tx_id:  txId,
+        vopay_disburse_status: 'submitted',
+      }).eq('id', loanId);
+
+      sendJSON(res, 200, { ok: true, txId, loanRef: loan.ref, amount: loan.principal });
+    } catch (err) {
+      sendJSON(res, 500, { error: err.message });
+    }
     return;
   }
 
