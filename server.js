@@ -869,8 +869,16 @@ async function handleRequest(req, res) {
     let body;
     try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
 
-    const { loanIds, confirmedBy = 'analyst', note = '' } = body;
-    if (!loanIds?.length) { sendJSON(res, 400, { error: 'loanIds array required' }); return; }
+    const { loanIds: rawIds, confirmedBy = 'analyst', note = '' } = body;
+
+    // Defensive: accept array or comma-string
+    const loanIds = Array.isArray(rawIds)
+      ? rawIds.filter(Boolean)
+      : String(rawIds || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    if (!loanIds.length) { sendJSON(res, 400, { error: 'loanIds array required' }); return; }
+
+    console.log(`[eft/drd/confirm] Confirming ${loanIds.length} loans:`, loanIds);
 
     try {
       const now = new Date().toISOString();
@@ -883,13 +891,16 @@ async function handleRequest(req, res) {
         .eq('status', 'pending_disbursement')
         .select('id, ref, principal, client_id');
 
-      if (error) throw error;
+      if (error) {
+        console.error('[eft/drd/confirm] Supabase update error:', error);
+        throw new Error(error.message || JSON.stringify(error));
+      }
 
-      // Try to stamp disbursed_at if the column exists (run migration to enable)
+      // Try to stamp disbursed_at if the column exists
       await supabase.from('loans')
         .update({ disbursed_at: now })
         .in('id', loanIds)
-        .catch(() => {}); // silent — column may not exist yet
+        .catch(e => console.warn('[eft/drd/confirm] disbursed_at not set (column may not exist):', e.message));
 
       // Write a client note for each loan
       for (const loan of (updated || [])) {
@@ -905,7 +916,7 @@ async function handleRequest(req, res) {
       console.log(`[eft/drd/confirm] ${count} loans marked active by ${confirmedBy}`);
       sendJSON(res, 200, { ok: true, activated: count, loans: updated?.map(l => ({ id: l.id, ref: l.ref })) });
     } catch (err) {
-      console.error('[eft/drd/confirm] Error:', err.message);
+      console.error('[eft/drd/confirm] Error:', err.message, err.stack?.split('\n')[1]);
       sendJSON(res, 500, { error: err.message });
     }
     return;
