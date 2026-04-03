@@ -25,6 +25,7 @@ const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProc
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
 const vopay = require('./vopayClient');
 const ibv   = require('./ibvClient');
+const kyc   = require('./kycClient');
 
 // ── PAYMENT PROCESSOR STATE ───────────────────────────────────────────────────
 // Persisted in memory — survives restarts via PAYMENT_PROCESSOR env var
@@ -568,6 +569,41 @@ async function handleRequest(req, res) {
       console.log(`[approve] ${app.ref} approved — $${approvedAmount} — loan ${loanId}`);
 
       // ── STEP 10: AUTO-DISBURSE VIA VOPAY (if active) ─────────────────────────
+      // ── STEP 9B: AUTO KYC SCREEN (if enabled, run before disburse) ───────────
+      if (kyc.isConfigured()) {
+        console.log('[approve] KYC — screening', app.ref);
+        try {
+          const kycResult = await kyc.screenIndividual({
+            firstName: client.first_name,
+            lastName:  client.last_name,
+            dob:       client.dob,
+            address:   client.address,
+            city:      client.city,
+            province:  client.province,
+            postal:    client.postal,
+          });
+
+          await supabase.from('loan_applications').update({
+            kyc_status:     kycResult.status,
+            kyc_result:     kycResult,
+            kyc_checked_at: new Date().toISOString(),
+          }).eq('id', applicationId);
+
+          // Block disbursement if flagged — leave as pending_disbursement for manual review
+          if (kycResult.status === 'flag') {
+            console.warn(`[approve] KYC FLAGGED for ${app.ref} — ${kycResult.summary}`);
+            await supabase.from('client_notes').insert({
+              client_id: app.client_id,
+              agent:     'system',
+              note:      `⚠️ KYC FLAG: ${kycResult.summary}. Loan ${app.ref} requires compliance review before disbursement.`,
+              context:   'kyc_flag',
+            }).catch(() => {});
+          }
+          console.log(`[approve] KYC ${app.ref} → ${kycResult.status}`);
+        } catch (kycErr) {
+          console.error('[approve] KYC error (non-fatal):', kycErr.message);
+        }
+      }
       let vopayDisburseTxId   = null;
       let vopayDisburseStatus = null;
 
@@ -1545,6 +1581,107 @@ async function handleRequest(req, res) {
 
     } catch (err) {
       console.error('[eft/clear] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/kyc/status ───────────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/kyc/status') {
+    sendJSON(res, 200, kyc.getStatus());
+    return;
+  }
+
+  // ── POST /api/kyc/screen/:applicationId ───────────────────────────────────────
+  // Manually trigger KYC screen from admin (for re-screening or initial screen)
+  if (req.method === 'POST' && req.url.startsWith('/api/kyc/screen/')) {
+    const applicationId = req.url.split('/api/kyc/screen/')[1];
+    if (!applicationId) { sendJSON(res, 400, { error: 'applicationId required' }); return; }
+
+    try {
+      const { data: app } = await supabase
+        .from('loan_applications')
+        .select('*, clients(first_name, last_name, dob, address, city, province, postal)')
+        .eq('id', applicationId).single();
+      if (!app) { sendJSON(res, 404, { error: 'Application not found' }); return; }
+
+      const client    = app.clients || {};
+      const firstName = client.first_name || app.first_name;
+      const lastName  = client.last_name  || app.last_name;
+
+      const result = await kyc.screenIndividual({
+        firstName, lastName,
+        dob:      client.dob      || app.dob,
+        address:  client.address  || app.address,
+        city:     client.city     || app.city,
+        province: client.province || app.province,
+        postal:   client.postal   || app.postal,
+      });
+
+      // Save result to application
+      await supabase.from('loan_applications').update({
+        kyc_status:     result.status,
+        kyc_result:     result,
+        kyc_checked_at: new Date().toISOString(),
+      }).eq('id', applicationId);
+
+      console.log(`[kyc] Manual screen ${app.ref} → ${result.status}`);
+      sendJSON(res, 200, { ok: true, applicationId, ref: app.ref, ...result });
+    } catch (err) {
+      console.error('[kyc] Manual screen error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/kyc/bulk-screen ─────────────────────────────────────────────────
+  // Screen all unscreened applications in bulk
+  if (req.method === 'POST' && req.url === '/api/kyc/bulk-screen') {
+    if (!kyc.isConfigured()) {
+      sendJSON(res, 400, { error: 'KYC not configured — set KYC_API_KEY and KYC_ENABLED=true in Railway' });
+      return;
+    }
+    try {
+      const { data: apps } = await supabase
+        .from('loan_applications')
+        .select('id, ref, first_name, last_name, dob, address, city, province, postal, client_id')
+        .is('kyc_status', null)
+        .limit(50);
+
+      if (!apps?.length) {
+        sendJSON(res, 200, { ok: true, screened: 0, message: 'No unscreened applications' });
+        return;
+      }
+
+      const results = [];
+      for (const app of apps) {
+        const result = await kyc.screenIndividual({
+          firstName: app.first_name,
+          lastName:  app.last_name,
+          dob:       app.dob,
+          address:   app.address,
+          city:      app.city,
+          province:  app.province,
+          postal:    app.postal,
+        });
+
+        await supabase.from('loan_applications').update({
+          kyc_status:     result.status,
+          kyc_result:     result,
+          kyc_checked_at: new Date().toISOString(),
+        }).eq('id', app.id);
+
+        results.push({ ref: app.ref, status: result.status, summary: result.summary });
+
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      const flagged = results.filter(r => r.status === 'flag').length;
+      const review  = results.filter(r => r.status === 'review').length;
+      console.log(`[kyc] Bulk screen: ${results.length} apps, ${flagged} flagged, ${review} for review`);
+      sendJSON(res, 200, { ok: true, screened: results.length, flagged, review, results });
+    } catch (err) {
       sendJSON(res, 500, { error: err.message });
     }
     return;
