@@ -1686,11 +1686,10 @@ async function handleRequest(req, res) {
   }
 
   // ── GET /api/config/payment-methods ──────────────────────────────────────────
-  // Returns active payment methods config — consumed by apply.html on load
-  // CORS open so apply.html can call it
   if (req.method === 'GET' && req.url === '/api/config/payment-methods') {
+    await settings.waitUntilLoaded();
     const raw = settings.get('payment_methods');
-    const methods = raw ? JSON.parse(raw) : getDefaultPaymentMethods();
+    const methods = (raw && raw !== 'null') ? JSON.parse(raw) : getDefaultPaymentMethods();
     sendJSON(res, 200, { methods });
     return;
   }

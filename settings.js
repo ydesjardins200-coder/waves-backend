@@ -28,6 +28,7 @@ const cache = {
   payment_processor: process.env.PAYMENT_PROCESSOR || 'manual',
   ibv_provider:      process.env.IBV_PROVIDER      || 'flinks',
   kyc_enabled:       process.env.KYC_ENABLED        || 'false',
+  payment_methods:   null, // loaded from DB; null = use code defaults
 };
 
 let loaded = false;
@@ -42,9 +43,11 @@ async function load() {
     if (error) throw new Error(error.message);
     if (data?.length) {
       for (const row of data) {
-        cache[row.key] = row.value;
+        if (row.value !== null && row.value !== undefined) {
+          cache[row.key] = row.value;
+        }
       }
-      console.log('[settings] Loaded from Supabase:', JSON.stringify(cache));
+      console.log('[settings] Loaded from Supabase:', Object.keys(cache).filter(k => cache[k] !== null).join(', '));
     } else {
       console.log('[settings] No settings in DB yet — seeding defaults');
       await seedDefaults();
@@ -91,4 +94,11 @@ function getProcessor()  { return get('payment_processor') || 'manual'; }
 function getIBVProvider(){ return get('ibv_provider')      || 'flinks'; }
 function isKYCEnabled()  { return get('kyc_enabled') === 'true'; }
 
-module.exports = { load, get, set, getAll, getProcessor, getIBVProvider, isKYCEnabled };
+function waitUntilLoaded() {
+  if (loaded) return Promise.resolve();
+  return new Promise(resolve => {
+    const iv = setInterval(() => { if (loaded) { clearInterval(iv); resolve(); } }, 20);
+  });
+}
+
+module.exports = { load, get, set, getAll, getProcessor, getIBVProvider, isKYCEnabled, waitUntilLoaded };
