@@ -127,22 +127,24 @@ function getFlinksEmbedUrl() {
 // Returns what the frontend needs to render the correct IBV widget
 
 async function getEmbedConfig({ redirectUrl } = {}) {
+  const flinksUrl        = getFlinksEmbedUrl();
+  const flinksConfigured = !!flinksUrl;
+
   if (isVoPay()) {
     if (!isVoPayConfigured()) {
-      // Fall back to Flinks if VoPay not yet configured
-      return { provider: 'flinks', flinksUrl: getFlinksEmbedUrl(), fallback: true };
+      return { provider: 'flinks', flinksUrl, flinksConfigured, fallback: true };
     }
     try {
       const { embedUrl } = await generateEmbedUrl({ redirectUrl });
       return { provider: 'vopay', embedUrl };
     } catch (err) {
       console.error('[ibv] iQ11 embed URL error:', err.message);
-      return { provider: 'flinks', flinksUrl: getFlinksEmbedUrl(), fallback: true, error: err.message };
+      return { provider: 'flinks', flinksUrl, flinksConfigured, fallback: true, error: err.message };
     }
   }
 
   // Flinks
-  return { provider: 'flinks', flinksUrl: getFlinksEmbedUrl() };
+  return { provider: 'flinks', flinksUrl, flinksConfigured };
 }
 
 module.exports = { getProvider, isVoPay, isFlinks, isVoPayConfigured, getStatus, generateEmbedUrl, getFlinksEmbedUrl, getEmbedConfig };
