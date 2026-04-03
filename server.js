@@ -23,15 +23,15 @@ const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
-const vopay = require('./vopayClient');
-const ibv   = require('./ibvClient');
-const kyc   = require('./kycClient');
+const vopay    = require('./vopayClient');
+const ibv      = require('./ibvClient');
+const kyc      = require('./kycClient');
+const settings = require('./settings');
 
-// ── PAYMENT PROCESSOR STATE ───────────────────────────────────────────────────
-// Persisted in memory — survives restarts via PAYMENT_PROCESSOR env var
-// Admin can switch via POST /api/processor/set
-let activeProcessor = process.env.PAYMENT_PROCESSOR || 'manual'; // 'manual' | 'vopay'
-console.log(`[processor] Active payment processor: ${activeProcessor}`);
+// ── STARTUP: load persisted settings from Supabase ────────────────────────────
+settings.load().then(() => {
+  console.log('[startup] Settings loaded:', JSON.stringify(settings.getAll()));
+});
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -570,7 +570,7 @@ async function handleRequest(req, res) {
 
       // ── STEP 10: AUTO-DISBURSE VIA VOPAY (if active) ─────────────────────────
       // ── STEP 9B: AUTO KYC SCREEN (if enabled, run before disburse) ───────────
-      if (kyc.isConfigured()) {
+      if (settings.isKYCEnabled() && kyc.isConfigured()) {
         console.log('[approve] KYC — screening', app.ref);
         try {
           const kycResult = await kyc.screenIndividual({
@@ -607,7 +607,7 @@ async function handleRequest(req, res) {
       let vopayDisburseTxId   = null;
       let vopayDisburseStatus = null;
 
-      if (activeProcessor === 'vopay' && vopay.isConfigured()) {
+      if (settings.getProcessor() === 'vopay' && vopay.isConfigured()) {
         console.log('[approve] Step 10 — disbursing via VoPay');
         try {
           // Grab banking coords — prefer app-level, fall back to client-level
@@ -668,7 +668,7 @@ async function handleRequest(req, res) {
         scheduleCount:       scheduleRows.length,
         firstPayment:        scheduleRows[0].due_date,
         finalPayment:        finalDate,
-        processor:           activeProcessor,
+        processor:           settings.getProcessor(),
         vopayDisburseTxId,
         vopayDisburseStatus,
       });
@@ -1588,7 +1588,7 @@ async function handleRequest(req, res) {
 
   // ── GET /api/kyc/status ───────────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/kyc/status') {
-    sendJSON(res, 200, kyc.getStatus());
+    sendJSON(res, 200, { ...kyc.getStatus(), enabled: settings.isKYCEnabled() });
     return;
   }
 
@@ -1634,11 +1634,25 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── POST /api/kyc/toggle ─────────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/kyc/toggle') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { enabled } = body;
+    if (typeof enabled !== 'boolean') { sendJSON(res, 400, { error: 'enabled (boolean) required' }); return; }
+    if (enabled && !kyc.isConfigured()) {
+      sendJSON(res, 400, { error: 'KYC not configured — set KYC_API_KEY in Railway env vars first' }); return;
+    }
+    await settings.set('kyc_enabled', String(enabled));
+    console.log(`[kyc] KYC screening ${enabled ? 'enabled' : 'disabled'}`);
+    sendJSON(res, 200, { ok: true, enabled: settings.isKYCEnabled() });
+    return;
+  }
+
   // ── POST /api/kyc/bulk-screen ─────────────────────────────────────────────────
-  // Screen all unscreened applications in bulk
   if (req.method === 'POST' && req.url === '/api/kyc/bulk-screen') {
-    if (!kyc.isConfigured()) {
-      sendJSON(res, 400, { error: 'KYC not configured — set KYC_API_KEY and KYC_ENABLED=true in Railway' });
+    if (!settings.isKYCEnabled() || !kyc.isConfigured()) {
+      sendJSON(res, 400, { error: 'KYC not configured — set KYC_API_KEY and enable KYC in admin' });
       return;
     }
     try {
@@ -1689,18 +1703,17 @@ async function handleRequest(req, res) {
 
   // ── GET /api/ibv/status ───────────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/ibv/status') {
-    sendJSON(res, 200, ibv.getStatus());
+    sendJSON(res, 200, { ...ibv.getStatus(), provider: settings.getIBVProvider() });
     return;
   }
 
   // ── GET /api/ibv/embed-url ────────────────────────────────────────────────────
-  // Returns the iFrame URL for the active IBV provider
-  // Frontend calls this when rendering the bank connection step
   if (req.method === 'GET' && req.url.startsWith('/api/ibv/embed-url')) {
     try {
-      const urlParams = new URL('http://x' + req.url).searchParams;
+      const urlParams  = new URL('http://x' + req.url).searchParams;
       const redirectUrl = urlParams.get('redirectUrl') || undefined;
-      const config = await ibv.getEmbedConfig({ redirectUrl });
+      // Use persisted provider from settings, not env var
+      const config = await ibv.getEmbedConfig({ redirectUrl, providerOverride: settings.getIBVProvider() });
       sendJSON(res, 200, config);
     } catch (err) {
       sendJSON(res, 500, { error: err.message });
@@ -1719,18 +1732,15 @@ async function handleRequest(req, res) {
     if (provider === 'vopay' && !ibv.isVoPayConfigured()) {
       sendJSON(res, 400, { error: 'VoPay credentials not configured — add VOPAY_ACCOUNT_ID, VOPAY_API_KEY, VOPAY_API_SECRET to Railway env vars' }); return;
     }
-    // IBV_PROVIDER is read from env — instruct admin to set it in Railway
-    sendJSON(res, 200, {
-      ok: true,
-      message: `Set IBV_PROVIDER=${provider} in Railway environment variables and redeploy to apply the change.`,
-      current: ibv.getProvider(),
-    });
+    await settings.set('ibv_provider', provider);
+    console.log(`[ibv] Provider switched to: ${provider}`);
+    sendJSON(res, 200, { ok: true, provider: settings.getIBVProvider() });
     return;
   }
 
   // ── GET /api/vopay/status ─────────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/vopay/status') {
-    sendJSON(res, 200, { ...vopay.getStatus(), activeProcessor });
+    sendJSON(res, 200, { ...vopay.getStatus(), activeProcessor: settings.getProcessor() });
     return;
   }
 
@@ -1745,15 +1755,15 @@ async function handleRequest(req, res) {
     if (processor === 'vopay' && !vopay.isConfigured()) {
       sendJSON(res, 400, { error: 'VoPay credentials not configured — add VOPAY_ACCOUNT_ID, VOPAY_API_KEY, VOPAY_API_SECRET to Railway env vars' }); return;
     }
-    activeProcessor = processor;
+    await settings.set('payment_processor', processor);
     console.log(`[processor] Switched to: ${processor}`);
-    sendJSON(res, 200, { ok: true, activeProcessor });
+    sendJSON(res, 200, { ok: true, activeProcessor: settings.getProcessor() });
     return;
   }
 
   // ── GET /api/processor/status ─────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/processor/status') {
-    sendJSON(res, 200, { activeProcessor, vopay: vopay.getStatus() });
+    sendJSON(res, 200, { activeProcessor: settings.getProcessor(), vopay: vopay.getStatus() });
     return;
   }
 

@@ -126,11 +126,12 @@ function getFlinksEmbedUrl() {
 // ── PROVIDER INFO FOR FRONTEND ────────────────────────────────────────────────
 // Returns what the frontend needs to render the correct IBV widget
 
-async function getEmbedConfig({ redirectUrl } = {}) {
+async function getEmbedConfig({ redirectUrl, providerOverride } = {}) {
   const flinksUrl        = getFlinksEmbedUrl();
   const flinksConfigured = !!flinksUrl;
+  const provider         = providerOverride || IBV_PROVIDER; // settings overrides env var
 
-  if (isVoPay()) {
+  if (provider === 'vopay') {
     if (!isVoPayConfigured()) {
       return { provider: 'flinks', flinksUrl, flinksConfigured, fallback: true };
     }
