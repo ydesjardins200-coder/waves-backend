@@ -23,6 +23,13 @@ const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
+const vopay = require('./vopayClient');
+
+// ── PAYMENT PROCESSOR STATE ───────────────────────────────────────────────────
+// Persisted in memory — survives restarts via PAYMENT_PROCESSOR env var
+// Admin can switch via POST /api/processor/set
+let activeProcessor = process.env.PAYMENT_PROCESSOR || 'manual'; // 'manual' | 'vopay'
+console.log(`[processor] Active payment processor: ${activeProcessor}`);
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -1479,6 +1486,88 @@ async function handleRequest(req, res) {
       console.error('[eft/clear] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
+    return;
+  }
+
+  // ── GET /api/vopay/status ─────────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/vopay/status') {
+    sendJSON(res, 200, { ...vopay.getStatus(), activeProcessor });
+    return;
+  }
+
+  // ── POST /api/processor/set ───────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/processor/set') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { processor } = body;
+    if (!['manual', 'vopay'].includes(processor)) {
+      sendJSON(res, 400, { error: 'processor must be manual or vopay' }); return;
+    }
+    if (processor === 'vopay' && !vopay.isConfigured()) {
+      sendJSON(res, 400, { error: 'VoPay credentials not configured — add VOPAY_ACCOUNT_ID, VOPAY_API_KEY, VOPAY_API_SECRET to Railway env vars' }); return;
+    }
+    activeProcessor = processor;
+    console.log(`[processor] Switched to: ${processor}`);
+    sendJSON(res, 200, { ok: true, activeProcessor });
+    return;
+  }
+
+  // ── GET /api/processor/status ─────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/processor/status') {
+    sendJSON(res, 200, { activeProcessor, vopay: vopay.getStatus() });
+    return;
+  }
+
+  // ── POST /api/vopay/webhook ───────────────────────────────────────────────────
+  // VoPay posts return/NSF notifications here — same effect as importing a return file
+  if (req.method === 'POST' && req.url === '/api/vopay/webhook') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid body' }); return; }
+
+    const event = vopay.parseWebhook(body);
+    console.log(`[vopay webhook] ${event.type} — ${event.status} — ref: ${event.ref} — txId: ${event.txId}`);
+
+    if (event.isReturned || event.isNSF) {
+      // Match to repayment_schedule by ClientReferenceNumber (loanRef-P{paymentNum})
+      const refParts = event.ref.split('-P');
+      const loanRef  = refParts[0];
+
+      if (loanRef) {
+        try {
+          // Find the loan
+          const { data: loan } = await supabase.from('loans').select('id,client_id').eq('ref', loanRef).single();
+          if (loan) {
+            // Update schedule row — mark as failed
+            await supabase.from('repayment_schedule')
+              .update({
+                status:        'failed',
+                return_code:   event.returnCode,
+                return_reason: event.returnMsg || event.status,
+                returned_at:   new Date().toISOString(),
+              })
+              .eq('loan_id', loan.id)
+              .eq('status',  'scheduled');
+
+            // Charge NSF fee if actual NSF
+            if (event.isNSF) {
+              await supabase.from('nsf_fees').insert({
+                client_id: loan.client_id,
+                loan_id:   loan.id,
+                amount:    45.00,
+                reason:    event.returnMsg || 'NSF via VoPay webhook',
+                return_code: event.returnCode,
+                status:    'outstanding',
+              });
+              console.log(`[vopay webhook] NSF fee charged for loan ${loanRef}`);
+            }
+          }
+        } catch (err) {
+          console.error('[vopay webhook] DB update error:', err.message);
+        }
+      }
+    }
+
+    sendJSON(res, 200, { ok: true, received: event });
     return;
   }
 
