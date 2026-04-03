@@ -852,11 +852,54 @@ async function handleRequest(req, res) {
         'Content-Disposition': `attachment; filename="${filename}"`,
         'Content-Length':      buf.length,
         'X-DRD-Summary':       JSON.stringify(summary),
+        'X-DRD-Loan-Ids':      loans.map(l => l.id).join(','),
       });
       res.end(buf);
       console.log(`[eft/drd] Generated ${filename} — ${summary.transactionCount} loans — $${summary.totalAmount}`);
     } catch (err) {
       console.error('[eft/drd] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/eft/drd/confirm ─────────────────────────────────────────────
+  // Called after admin submits DRD file to Desjardins — marks loans as active
+  if (req.method === 'POST' && req.url === '/api/eft/drd/confirm') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { loanIds, confirmedBy = 'analyst', note = '' } = body;
+    if (!loanIds?.length) { sendJSON(res, 400, { error: 'loanIds array required' }); return; }
+
+    try {
+      const now = new Date().toISOString();
+
+      // Flip all listed loans from pending_disbursement → active
+      const { data: updated, error } = await supabase
+        .from('loans')
+        .update({ status: 'active', disbursed_at: now })
+        .in('id', loanIds)
+        .eq('status', 'pending_disbursement')
+        .select('id, ref, principal, client_id');
+
+      if (error) throw error;
+
+      // Write a client note for each loan
+      for (const loan of (updated || [])) {
+        await supabase.from('client_notes').insert({
+          client_id: loan.client_id,
+          agent:     confirmedBy || 'analyst',
+          note:      `Loan ${loan.ref} ($${loan.principal}) disbursed via DRD — marked active. ${note}`.trim(),
+          context:   'disbursement',
+        }).catch(() => {});
+      }
+
+      const count = updated?.length || 0;
+      console.log(`[eft/drd/confirm] ${count} loans marked active by ${confirmedBy}`);
+      sendJSON(res, 200, { ok: true, activated: count, loans: updated?.map(l => ({ id: l.id, ref: l.ref })) });
+    } catch (err) {
+      console.error('[eft/drd/confirm] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;
