@@ -1696,6 +1696,77 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── POST /api/loans/:loanId/recalc-fees ──────────────────────────────────────
+  // Recalculates scheduled_amount on all schedule rows to include optional fees
+  // Used when a loan was approved before optional fees were wired into the calc
+  if (req.method === 'POST' && req.url.match(/^\/api\/loans\/[^/]+\/recalc-fees$/)) {
+    const loanId = req.url.split('/')[3];
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { applicationId } = body;
+
+    try {
+      // Load the loan
+      const { data: loan } = await supabase.from('loans')
+        .select('id, ref, principal, payment_count, payment_frequency, apr, term_days, client_id')
+        .eq('id', loanId).single();
+      if (!loan) { sendJSON(res, 404, { error: 'Loan not found' }); return; }
+
+      // Load optional fees from the application
+      const appQuery = applicationId
+        ? supabase.from('loan_applications').select('optional_fees').eq('id', applicationId).single()
+        : supabase.from('loan_applications').select('optional_fees').eq('ref', loan.ref).single();
+      const { data: app } = await appQuery;
+
+      const optionalFees      = (app?.optional_fees && app.optional_fees !== 'null')
+        ? JSON.parse(app.optional_fees) : [];
+      const optionalFeesTotal = optionalFees.reduce((s, f) => s + parseFloat(f.fee || 0), 0);
+
+      // Recalculate payment amount
+      const APR            = parseFloat(loan.apr || 0.23);
+      const termDays       = loan.term_days || 112;
+      const paymentCount   = loan.payment_count || 8;
+      const principal      = parseFloat(loan.principal);
+      const feePerPayment  = parseFloat((optionalFeesTotal / paymentCount).toFixed(2));
+      const basePayment    = parseFloat(((principal * (1 + APR * termDays / 365)) / paymentCount).toFixed(2));
+      const newPaymentAmt  = basePayment + feePerPayment;
+      const newTotalRepay  = parseFloat((newPaymentAmt * paymentCount).toFixed(2));
+
+      console.log(`[recalc-fees] ${loan.ref} — base $${basePayment} + fee $${feePerPayment} = $${newPaymentAmt}/payment`);
+
+      // Update all scheduled rows
+      const { data: updated, error } = await supabase
+        .from('repayment_schedule')
+        .update({ scheduled_amount: newPaymentAmt })
+        .eq('loan_id', loanId)
+        .eq('status', 'scheduled')
+        .select('id');
+
+      if (error) throw new Error(error.message);
+
+      // Update loan totals
+      await supabase.from('loans').update({
+        payment_amount:    newPaymentAmt,
+        total_repayable:   newTotalRepay,
+        remaining_balance: newTotalRepay - parseFloat(loan.total_paid || 0),
+      }).eq('id', loanId);
+
+      sendJSON(res, 200, {
+        ok:               true,
+        loanRef:          loan.ref,
+        newPaymentAmount: newPaymentAmt,
+        newTotalRepay,
+        paymentsUpdated:  updated?.length || 0,
+        optionalFees,
+        optionalFeesTotal,
+      });
+    } catch (err) {
+      console.error('[recalc-fees] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // ── GET /api/config/optional-fees ────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/config/optional-fees') {
     await settings.waitUntilLoaded();
