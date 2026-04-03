@@ -422,8 +422,18 @@ async function handleRequest(req, res) {
       const APR           = 0.23;
       const TERM_DAYS     = 112;
       const PAYMENT_COUNT = 8;
-      const paymentAmt    = parseFloat(((approvedAmount * (1 + APR * TERM_DAYS / 365)) / PAYMENT_COUNT).toFixed(2));
+
+      // Optional fees — loaded from application record, spread across payments
+      const optionalFees     = app.optional_fees ? JSON.parse(app.optional_fees) : [];
+      const optionalFeesTotal = optionalFees.reduce((s, f) => s + parseFloat(f.fee || 0), 0);
+      const feePerPayment    = parseFloat((optionalFeesTotal / PAYMENT_COUNT).toFixed(2));
+
+      const paymentAmt     = parseFloat(((approvedAmount * (1 + APR * TERM_DAYS / 365)) / PAYMENT_COUNT).toFixed(2)) + feePerPayment;
       const totalRepayable = parseFloat((paymentAmt * PAYMENT_COUNT).toFixed(2));
+
+      if (optionalFeesTotal > 0) {
+        console.log(`[approve] Optional fees: $${optionalFeesTotal} (${optionalFees.map(f=>f.label).join(', ')}) — +$${feePerPayment}/payment`);
+      }
 
       console.log('[approve] Step 4 — checking for existing loan ref:', app.ref);
       // 4. Check if a loan record already exists for this application
@@ -461,6 +471,7 @@ async function handleRequest(req, res) {
           total_paid:        0,
           status:            'pending_disbursement',
           fund_method:       app.fund_method,
+          optional_fees:     app.optional_fees || null,
         }).select('id, ref, principal, payment_amount, total_repayable, payment_count').single();
         if (loanErr) throw new Error('Loan create failed: ' + loanErr.message);
         loanId = newLoan.id;
@@ -1682,6 +1693,32 @@ async function handleRequest(req, res) {
       console.error('[eft/clear] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
+    return;
+  }
+
+  // ── GET /api/config/optional-fees ────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/config/optional-fees') {
+    await settings.waitUntilLoaded();
+    const raw  = settings.get('optional_fees');
+    const fees = (raw && raw !== 'null') ? JSON.parse(raw) : [];
+    sendJSON(res, 200, { fees });
+    return;
+  }
+
+  // ── POST /api/config/optional-fees ───────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/config/optional-fees') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { fees } = body;
+    if (!Array.isArray(fees)) { sendJSON(res, 400, { error: 'fees array required' }); return; }
+    for (const f of fees) {
+      if (!f.id || !f.label) { sendJSON(res, 400, { error: 'Each fee needs id and label' }); return; }
+      f.fee     = parseFloat(f.fee || 0);
+      f.enabled = !!f.enabled;
+    }
+    await settings.set('optional_fees', JSON.stringify(fees));
+    console.log('[config] Optional fees saved:', fees.map(f => `${f.id}($${f.fee})`).join(', '));
+    sendJSON(res, 200, { ok: true, fees });
     return;
   }
 

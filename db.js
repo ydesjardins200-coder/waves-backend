@@ -191,6 +191,7 @@ async function saveAppRecord(payload, scoringResult, bankData, clientId) {
 
     requested_amount: loan?.amount,
     fund_method:      loan?.fundMethod,
+    optional_fees:    loan?.optionalFees?.length ? JSON.stringify(loan.optionalFees) : null,
     bankrupt_now:     loan?.bankruptNow,
     bankrupt_past:    loan?.bankruptPast,
 
