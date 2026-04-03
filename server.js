@@ -878,12 +878,18 @@ async function handleRequest(req, res) {
       // Flip all listed loans from pending_disbursement → active
       const { data: updated, error } = await supabase
         .from('loans')
-        .update({ status: 'active', disbursed_at: now })
+        .update({ status: 'active' })
         .in('id', loanIds)
         .eq('status', 'pending_disbursement')
         .select('id, ref, principal, client_id');
 
       if (error) throw error;
+
+      // Try to stamp disbursed_at if the column exists (run migration to enable)
+      await supabase.from('loans')
+        .update({ disbursed_at: now })
+        .in('id', loanIds)
+        .catch(() => {}); // silent — column may not exist yet
 
       // Write a client note for each loan
       for (const loan of (updated || [])) {
