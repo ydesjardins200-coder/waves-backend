@@ -1708,7 +1708,7 @@ async function handleRequest(req, res) {
     try {
       // Load the loan
       const { data: loan } = await supabase.from('loans')
-        .select('id, ref, principal, payment_count, payment_frequency, apr, term_days, client_id')
+        .select('id, ref, principal, payment_count, payment_frequency, apr, term_days, client_id, total_paid')
         .eq('id', loanId).single();
       if (!loan) { sendJSON(res, 404, { error: 'Loan not found' }); return; }
 
@@ -1732,17 +1732,22 @@ async function handleRequest(req, res) {
       const newPaymentAmt  = basePayment + feePerPayment;
       const newTotalRepay  = parseFloat((newPaymentAmt * paymentCount).toFixed(2));
 
-      console.log(`[recalc-fees] ${loan.ref} — base $${basePayment} + fee $${feePerPayment} = $${newPaymentAmt}/payment`);
+      console.log(`[recalc-fees] ${loan.ref} — principal $${principal}, optFees $${optionalFeesTotal}, base $${basePayment} + $${feePerPayment}/pmt = $${newPaymentAmt}, total $${newTotalRepay}`);
 
-      // Update all scheduled rows
+      // Update all non-paid rows (scheduled, failed, missed — anything not yet settled)
       const { data: updated, error } = await supabase
         .from('repayment_schedule')
         .update({ scheduled_amount: newPaymentAmt })
         .eq('loan_id', loanId)
-        .eq('status', 'scheduled')
+        .in('status', ['scheduled', 'failed', 'missed'])
         .select('id');
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        console.error('[recalc-fees] schedule update error:', error.message, error.details, error.hint);
+        throw new Error('Schedule update failed: ' + error.message);
+      }
+
+      console.log(`[recalc-fees] updated ${updated?.length || 0} schedule rows`);
 
       // Update loan totals
       await supabase.from('loans').update({
