@@ -28,6 +28,15 @@ const ibv      = require('./ibvClient');
 const kyc      = require('./kycClient');
 const settings = require('./settings');
 
+// ── PAYMENT METHODS DEFAULT CONFIG ───────────────────────────────────────────
+function getDefaultPaymentMethods() {
+  return [
+    { id:'direct',   label:'Direct Deposit',      description:'Same day if approved before 2:30 PM EST.',               fee:0, enabled:true,  badgeType:'free', provinces:[] },
+    { id:'instant',  label:'Instant Deposit',      description:'In your account within 1–2 hours of approval.',          fee:0, enabled:true,  badgeType:'none', provinces:[] },
+    { id:'etransfer',label:'Interac e-Transfer®',  description:'Sent to your email on file within ~2 minutes of approval.', fee:6, enabled:true, badgeType:'fee',  provinces:[] },
+  ];
+}
+
 // ── STARTUP: load persisted settings from Supabase ────────────────────────────
 settings.load().then(() => {
   console.log('[startup] Settings loaded:', JSON.stringify(settings.getAll()));
@@ -1673,6 +1682,35 @@ async function handleRequest(req, res) {
       console.error('[eft/clear] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
+    return;
+  }
+
+  // ── GET /api/config/payment-methods ──────────────────────────────────────────
+  // Returns active payment methods config — consumed by apply.html on load
+  // CORS open so apply.html can call it
+  if (req.method === 'GET' && req.url === '/api/config/payment-methods') {
+    const raw = settings.get('payment_methods');
+    const methods = raw ? JSON.parse(raw) : getDefaultPaymentMethods();
+    sendJSON(res, 200, { methods });
+    return;
+  }
+
+  // ── POST /api/config/payment-methods ─────────────────────────────────────────
+  // Saves payment methods config from admin
+  if (req.method === 'POST' && req.url === '/api/config/payment-methods') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { methods } = body;
+    if (!Array.isArray(methods)) { sendJSON(res, 400, { error: 'methods array required' }); return; }
+    // Validate each method has required fields
+    for (const m of methods) {
+      if (!m.id || !m.label) { sendJSON(res, 400, { error: 'Each method needs id and label' }); return; }
+      m.fee     = parseFloat(m.fee || 0);
+      m.enabled = !!m.enabled;
+    }
+    await settings.set('payment_methods', JSON.stringify(methods));
+    console.log('[config] Payment methods saved:', methods.map(m => `${m.id}(${m.enabled?'on':'off'} $${m.fee})`).join(', '));
+    sendJSON(res, 200, { ok: true, methods });
     return;
   }
 
