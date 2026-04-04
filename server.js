@@ -1774,6 +1774,30 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── POST /api/admin/reset-db ──────────────────────────────────────────────────
+  // Wipes all operational data — clients, loans, applications, schedule, contracts, NSF
+  // Requires { confirm: 'RESET' } in body. Double-gated: wrong confirm = 403.
+  if (req.method === 'POST' && req.url === '/api/admin/reset-db') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    if (body?.confirm !== 'RESET') { sendJSON(res, 403, { error: 'Confirm token mismatch' }); return; }
+    try {
+      const tables = ['nsf_fees','repayment_schedule','contracts','client_notes','application_notes','loans','loan_applications','clients'];
+      const results = [];
+      for (const table of tables) {
+        const { error, count } = await supabase.from(table).delete({ count: 'exact' }).neq('id', '00000000-0000-0000-0000-000000000000');
+        if (error) { console.error(`[reset-db] ${table}:`, error.message); results.push(`${table}: error`); }
+        else results.push(`${table}: ${count||0} deleted`);
+      }
+      console.log('[reset-db] Reset complete:', results.join(', '));
+      sendJSON(res, 200, { ok: true, deleted: results.join(' · ') });
+    } catch(err) {
+      console.error('[reset-db] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // ── GET /api/config/loan-settings ────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/config/loan-settings') {
     await settings.waitUntilLoaded();
