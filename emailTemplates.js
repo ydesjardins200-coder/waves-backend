@@ -67,12 +67,12 @@ const DEFAULTS = {
     <p>Hi <strong>{{first_name}}</strong>,</p>
     <p>Great news — your loan application has been <strong>approved</strong>.</p>
     <div class="highlight" style="background:#f0f0ff;border-color:#5B52D8">
-      <div class="lbl">Loan Amount</div><div class="val" style="color:#3B35B0">${{loan_amount}}</div>
+      <div class="lbl">Loan Amount</div><div class="val" style="color:#3B35B0">\${{loan_amount}}</div>
     </div>
     <div class="grid">
       <div class="cell"><div class="lbl">Reference</div><div class="val">{{loan_ref}}</div></div>
       <div class="cell"><div class="lbl">Funding Method</div><div class="val">{{fund_method}}</div></div>
-      <div class="cell"><div class="lbl">Payment Amount</div><div class="val">${{payment_amount}} × {{payment_count}}</div></div>
+      <div class="cell"><div class="lbl">Payment Amount</div><div class="val">\${{payment_amount}} × {{payment_count}}</div></div>
       <div class="cell"><div class="lbl">First Payment</div><div class="val">{{first_payment}}</div></div>
     </div>
     <p>Questions? Contact us at <a href="mailto:{{support_email}}">{{support_email}}</a>.</p>
@@ -113,13 +113,13 @@ const DEFAULTS = {
     <p>Hi <strong>{{first_name}}</strong>,</p>
     <p>We were unable to process your scheduled payment for loan <strong>{{loan_ref}}</strong>.</p>
     <div class="highlight" style="background:#fff5f5;border-color:#d85252">
-      <div class="lbl">NSF Fee Applied</div><div class="val" style="color:#c00">${{nsf_fee}}</div>
+      <div class="lbl">NSF Fee Applied</div><div class="val" style="color:#c00">\${{nsf_fee}}</div>
     </div>
     <div class="grid">
       <div class="cell"><div class="lbl">Loan Ref</div><div class="val">{{loan_ref}}</div></div>
-      <div class="cell"><div class="lbl">Payment Due</div><div class="val">${{payment_amount}}</div></div>
+      <div class="cell"><div class="lbl">Payment Due</div><div class="val">\${{payment_amount}}</div></div>
       <div class="cell"><div class="lbl">Due Date</div><div class="val">{{due_date}}</div></div>
-      <div class="cell"><div class="lbl">NSF Fee</div><div class="val">${{nsf_fee}}</div></div>
+      <div class="cell"><div class="lbl">NSF Fee</div><div class="val">\${{nsf_fee}}</div></div>
     </div>
     <p>Please contact us immediately at <a href="mailto:{{support_email}}">{{support_email}}</a> or <strong>{{support_phone}}</strong>.</p>
   </div>
@@ -140,13 +140,13 @@ const DEFAULTS = {
     <p>Hi <strong>{{first_name}}</strong>,</p>
     <p>Your funds have been sent!</p>
     <div class="highlight" style="background:#f0fff9;border-color:#1DE9C6">
-      <div class="lbl">Amount Sent</div><div class="val" style="color:#0d7c5a">${{loan_amount}}</div>
+      <div class="lbl">Amount Sent</div><div class="val" style="color:#0d7c5a">\${{loan_amount}}</div>
     </div>
     <div class="grid">
       <div class="cell"><div class="lbl">Reference</div><div class="val">{{loan_ref}}</div></div>
       <div class="cell"><div class="lbl">Method</div><div class="val">{{fund_method}}</div></div>
       <div class="cell"><div class="lbl">First Payment</div><div class="val">{{first_payment}}</div></div>
-      <div class="cell"><div class="lbl">Payment Amount</div><div class="val">${{payment_amount}}</div></div>
+      <div class="cell"><div class="lbl">Payment Amount</div><div class="val">\${{payment_amount}}</div></div>
     </div>
     <p>Payments will be collected automatically via Pre-Authorized Debit. Questions? <a href="mailto:{{support_email}}">{{support_email}}</a></p>
   </div>
@@ -165,7 +165,7 @@ const DEFAULTS = {
   </div>
   <div class="body">
     <p>Hi <strong>{{first_name}}</strong>,</p>
-    <p>This is a friendly reminder that your next payment of <strong>${{payment_amount}}</strong> is due on <strong>{{due_date}}</strong>.</p>
+    <p>This is a friendly reminder that your next payment of <strong>\${{payment_amount}}</strong> is due on <strong>{{due_date}}</strong>.</p>
     <p>Payments are collected automatically via Pre-Authorized Debit — no action required if funds are available.</p>
     <p>Questions? <a href="mailto:{{support_email}}">{{support_email}}</a> · {{support_phone}}</p>
   </div>
@@ -207,7 +207,7 @@ const DEFAULTS = {
     <div class="grid">
       <div class="cell"><div class="lbl">Reference</div><div class="val">{{loan_ref}}</div></div>
       <div class="cell"><div class="lbl">Applicant</div><div class="val">{{first_name}} {{last_name}}</div></div>
-      <div class="cell"><div class="lbl">Amount</div><div class="val">${{loan_amount}}</div></div>
+      <div class="cell"><div class="lbl">Amount</div><div class="val">\${{loan_amount}}</div></div>
       <div class="cell"><div class="lbl">Email</div><div class="val">{{to_email}}</div></div>
     </div>
     <p><a href="https://wavesfinancial.ca/admin.html">Open Admin Dashboard →</a></p>
@@ -229,8 +229,8 @@ const DEFAULTS = {
     <div class="grid">
       <div class="cell"><div class="lbl">Loan Ref</div><div class="val">{{loan_ref}}</div></div>
       <div class="cell"><div class="lbl">Client</div><div class="val">{{first_name}} {{last_name}}</div></div>
-      <div class="cell"><div class="lbl">Payment</div><div class="val">${{payment_amount}}</div></div>
-      <div class="cell"><div class="lbl">NSF Fee</div><div class="val">${{nsf_fee}}</div></div>
+      <div class="cell"><div class="lbl">Payment</div><div class="val">\${{payment_amount}}</div></div>
+      <div class="cell"><div class="lbl">NSF Fee</div><div class="val">\${{nsf_fee}}</div></div>
     </div>
     <p><a href="https://wavesfinancial.ca/admin.html">Open Admin Dashboard →</a></p>
   </div>
