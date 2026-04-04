@@ -782,7 +782,7 @@ async function handleRequest(req, res) {
         .from('loans')
         .select('id, ref, principal, client_id, fund_method, status')
         .eq('status', 'pending_disbursement')
-        .eq('fund_method', 'etransfer')
+        .in('fund_method', ['etransfer', 'interac'])
         .order('created_at', { ascending: true });
 
       if (loanIds.length) query = query.in('id', loanIds);
