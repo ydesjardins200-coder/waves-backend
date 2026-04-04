@@ -21,6 +21,7 @@ const {
 const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator');
 const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
+const { generateETransfer }                         = require('./etransferGenerator');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
 const vopay    = require('./vopayClient');
@@ -759,6 +760,126 @@ async function handleRequest(req, res) {
       sendJSON(res, 200, { ok: true });
     } catch (err) {
       console.error('[decline] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /api/eft/etransfer ────────────────────────────────────────────────
+  // Generates Desjardins bulk Interac e-Transfer CSV for all
+  // pending_disbursement loans where fund_method = 'etransfer'
+  if (req.method === 'GET' && req.url.startsWith('/api/eft/etransfer') && !req.url.includes('/confirm')) {
+    try {
+      const urlObj  = new URL(req.url, 'http://localhost');
+      const loanIds = urlObj.searchParams.get('loanIds')?.split(',').filter(Boolean) || [];
+      const fileNum = parseInt(urlObj.searchParams.get('fileNum') || '1');
+      const effDate = urlObj.searchParams.get('effectiveDate')
+        ? new Date(urlObj.searchParams.get('effectiveDate'))
+        : new Date();
+
+      // Load e-transfer pending loans
+      let query = supabase
+        .from('loans')
+        .select('id, ref, principal, client_id, fund_method, status')
+        .eq('status', 'pending_disbursement')
+        .eq('fund_method', 'etransfer')
+        .order('created_at', { ascending: true });
+
+      if (loanIds.length) query = query.in('id', loanIds);
+      const { data: loans, error } = await query;
+      if (error) throw error;
+
+      if (!loans || !loans.length) {
+        sendJSON(res, 200, { message: 'No pending e-Transfer loans found', content: null });
+        return;
+      }
+
+      // Enrich with borrower email
+      const etLoans = [];
+      for (const loan of loans) {
+        const clientRes = await supabase
+          .from('clients')
+          .select('first_name, last_name, email')
+          .eq('id', loan.client_id).single();
+        const client = clientRes.data || {};
+        etLoans.push({
+          ref:           loan.ref,
+          amount:        loan.principal,
+          borrowerName:  `${client.first_name || ''} ${client.last_name || ''}`.trim() || '—',
+          borrowerEmail: client.email || '',
+        });
+      }
+
+      const { filename, content, summary, errors } = generateETransfer(etLoans, { effectiveDate: effDate, fileNumber: fileNum });
+
+      if (!content) {
+        sendJSON(res, 400, { error: 'No valid loans — missing email addresses', errors });
+        return;
+      }
+
+      if (errors.length) console.warn('[eft/etransfer] Skipped loans:', errors);
+
+      const buf = Buffer.from(content, 'utf8');
+      res.writeHead(200, {
+        'Content-Type':        'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length':      buf.length,
+        'X-ETRANSFER-Summary': JSON.stringify(summary),
+        'X-ETRANSFER-Loan-Ids': loans.map(l => l.id).join(','),
+      });
+      res.end(buf);
+      console.log(`[eft/etransfer] Generated ${filename} — ${summary.transactionCount} transfers — $${summary.totalAmount}`);
+    } catch (err) {
+      console.error('[eft/etransfer] Error:', err.message);
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ── POST /api/eft/etransfer/confirm ────────────────────────────────────────
+  // Called after admin submits e-Transfer CSV to Desjardins — marks loans active
+  if (req.method === 'POST' && req.url === '/api/eft/etransfer/confirm') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+
+    const { loanIds: rawIds, confirmedBy = 'analyst', note = '' } = body;
+    const loanIds = Array.isArray(rawIds)
+      ? rawIds.filter(Boolean)
+      : String(rawIds || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    if (!loanIds.length) { sendJSON(res, 400, { error: 'loanIds array required' }); return; }
+
+    if (!supabase) {
+      sendJSON(res, 500, { error: 'Database not connected' });
+      return;
+    }
+
+    try {
+      const now = new Date().toISOString();
+
+      const { data: updated, error } = await supabase
+        .from('loans')
+        .update({ status: 'active', disbursed_at: now })
+        .in('id', loanIds)
+        .eq('status', 'pending_disbursement')
+        .select('id, ref, principal, client_id');
+
+      if (error) throw new Error(error.message);
+
+      for (const loan of (updated || [])) {
+        await supabase.from('client_notes').insert({
+          client_id: loan.client_id,
+          agent:     confirmedBy || 'analyst',
+          note:      `Loan ${loan.ref} ($${loan.principal}) disbursed via Interac e-Transfer — marked active. ${note}`.trim(),
+          context:   'disbursement',
+        }).then(() => {}, () => {});
+      }
+
+      const count = updated?.length || 0;
+      console.log(`[eft/etransfer/confirm] ${count} loans marked active by ${confirmedBy}`);
+      sendJSON(res, 200, { ok: true, activated: count, loans: updated?.map(l => ({ id: l.id, ref: l.ref })) });
+    } catch (err) {
+      console.error('[eft/etransfer/confirm] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
     return;
