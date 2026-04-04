@@ -29,6 +29,7 @@ const cache = {
   ibv_provider:      process.env.IBV_PROVIDER      || 'flinks',
   kyc_enabled:       process.env.KYC_ENABLED        || 'false',
   payment_methods:   null, // loaded from DB; null = use code defaults
+  served_provinces:  JSON.stringify(['BC','ON','NS','NB','PE','NL']), // default 6 provinces
 };
 
 let loaded = false;
@@ -79,13 +80,16 @@ function getAll() {
 
 async function set(key, value) {
   cache[key] = value;
-  if (!supabase) return;
+  if (!supabase) {
+    console.warn(`[settings] No Supabase — ${key} updated in-memory only (will reset on restart)`);
+    return;
+  }
   const { error } = await supabase.from('system_settings').upsert(
     { key, value, updated_at: new Date().toISOString() },
     { onConflict: 'key' }
   );
-  if (error) console.error(`[settings] Failed to persist ${key}=${value}:`, error.message);
-  else console.log(`[settings] Saved ${key}=${value}`);
+  if (error) console.error(`[settings] Failed to persist ${key}:`, error.message);
+  else console.log(`[settings] Persisted ${key} to Supabase`);
 }
 
 // ── TYPED GETTERS ─────────────────────────────────────────────────────────────
