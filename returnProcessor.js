@@ -13,6 +13,7 @@
  */
 
 const { supabase } = require('./supabaseClient');
+const { sendEmail } = require('./emailClient');
 
 // ─── RETURN CODES ─────────────────────────────────────────────────────────────
 
@@ -32,7 +33,8 @@ const RETURN_CODES = {
   '921': { reason: 'No Pre-Authorized Debit Agreement on File', status:'failed',   retry: false, fee: false },
 };
 
-const NSF_FEE_AMOUNT = 45.00;
+const settings        = require('./settings');
+const NSF_FEE_AMOUNT  = () => settings.getLoanSettings().nsfFee;
 const NSF_RETRY_DAYS = 5;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -235,20 +237,29 @@ async function processReturnFile(content, filename = 'return-file.txt') {
         client_id:   loan.client_id,
         loan_id:     loan.id,
         schedule_id: schedRow.id,
-        amount:      NSF_FEE_AMOUNT,
+        amount:      NSF_FEE_AMOUNT(),
         reason:      `NSF on payment ${schedRow.payment_number} of ${loan.ref}`,
         return_code: ret.returnCode,
         status:      'outstanding',
       });
       if (feeErr) console.error('[returns] NSF fee insert error:', feeErr.message);
-      else { summary.nsfFees++; summary.nsfTotal += NSF_FEE_AMOUNT; }
+      else { summary.nsfFees++; summary.nsfTotal += NSF_FEE_AMOUNT(); }
+
+      // Send NSF email (non-blocking)
+      try {
+        const { data: cl } = await supabase.from('clients').select('email,first_name').eq('id', loan.client_id).single();
+        if (cl?.email) {
+          await sendEmail({ event:'nsf_triggered', to:cl.email, clientId:loan.client_id, loanRef:loan.ref, supabase,
+            data:{ first_name:cl.first_name||'', loan_ref:loan.ref, payment_amount:parseFloat(schedRow.scheduled_amount||0).toFixed(2), due_date:schedRow.due_date||'—', nsf_fee:NSF_FEE_AMOUNT() } });
+        }
+      } catch(emailErr) { console.warn('[returns] NSF email failed (non-fatal):', emailErr.message); }
 
       // Log client note
       try {
         await supabase.from('client_notes').insert({
           client_id: loan.client_id,
           agent:     'system',
-          note:      `NSF returned on ${loan.ref} payment #${schedRow.payment_number} ($${parseFloat(schedRow.scheduled_amount).toFixed(2)}). $${NSF_FEE_AMOUNT} fee charged. Retry scheduled: ${toISO(retryDate)}.`,
+          note:      `NSF returned on ${loan.ref} payment #${schedRow.payment_number} ($${parseFloat(schedRow.scheduled_amount).toFixed(2)}). $${NSF_FEE_AMOUNT()} fee charged. Retry scheduled: ${toISO(retryDate)}.`,
           context:   'nsf',
         });
       } catch(e) { console.warn('[returns] client note error:', e.message); }
@@ -285,7 +296,7 @@ async function processReturnFile(content, filename = 'return-file.txt') {
       returnCode:    ret.returnCode,
       reason:        codeInfo.reason,
       newStatus:     codeInfo.status,
-      nsfFee:        codeInfo.fee ? `$${NSF_FEE_AMOUNT}` : null,
+      nsfFee:        codeInfo.fee ? `$${NSF_FEE_AMOUNT()}` : null,
       retryDate:     updates.retry_date || null,
     });
   }

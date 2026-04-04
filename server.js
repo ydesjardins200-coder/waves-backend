@@ -22,6 +22,7 @@ const { generateContractPDF, generateBankReportPDF } = require('./pdfGenerator')
 const { supabase } = require('./supabaseClient');
 const { generateDRD, generatePAD, nextBusinessDay } = require('./drdGenerator');
 const { generateETransfer }                         = require('./etransferGenerator');
+const { sendEmail, getProvider }                    = require('./emailClient');
 const { processReturnFile, getRetryQueue, RETURN_CODES } = require('./returnProcessor');
 const { fetchCreditReport, getAccessToken } = require('./equifaxClient');
 const vopay    = require('./vopayClient');
@@ -694,6 +695,34 @@ async function handleRequest(req, res) {
         vopayDisburseTxId,
         vopayDisburseStatus,
       });
+
+      // Send approval email (non-blocking — don't fail approve if email fails)
+      try {
+        const { data: emailClient } = await supabase.from('clients').select('email,first_name,last_name').eq('id', app.client_id).single();
+        if (emailClient?.email) {
+          const fundLabel = { direct:'Direct Deposit', etransfer:'Interac e-Transfer', interac:'Interac e-Transfer', instant:'Instant Deposit' }[app.fund_method] || app.fund_method || '—';
+          await sendEmail({
+            event:    'loan_approved',
+            to:       emailClient.email,
+            clientId: app.client_id,
+            loanRef:  app.ref,
+            supabase,
+            data: {
+              first_name:     emailClient.first_name || '',
+              last_name:      emailClient.last_name  || '',
+              loan_ref:       app.ref,
+              loan_amount:    approvedAmount,
+              payment_amount: paymentAmt.toFixed(2),
+              payment_count:  PAYMENT_COUNT,
+              first_payment:  scheduleRows[0]?.due_date || '—',
+              fund_method:    fundLabel,
+              apr:            Math.round(APR * 100),
+            },
+          });
+        }
+      } catch (emailErr) {
+        console.warn('[approve] Email failed (non-fatal):', emailErr.message);
+      }
     } catch (err) {
       console.error('[approve] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
@@ -757,6 +786,16 @@ async function handleRequest(req, res) {
       }).eq('id', app.client_id);
 
       console.log(`[decline] ${app.ref} declined`);
+
+      // Send decline email (non-blocking)
+      try {
+        const { data: decClient } = await supabase.from('clients').select('email,first_name,last_name').eq('id', app.client_id).single();
+        if (decClient?.email) {
+          await sendEmail({ event:'loan_declined', to:decClient.email, clientId:app.client_id, loanRef:app.ref, supabase,
+            data:{ first_name:decClient.first_name||'', last_name:decClient.last_name||'', loan_ref:app.ref } });
+        }
+      } catch(emailErr) { console.warn('[decline] Email failed (non-fatal):', emailErr.message); }
+
       sendJSON(res, 200, { ok: true });
     } catch (err) {
       console.error('[decline] Error:', err.message);
@@ -765,7 +804,89 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // ── GET /api/eft/etransfer ────────────────────────────────────────────────
+  // ── GET /api/email/provider ───────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/email/provider') {
+    await settings.waitUntilLoaded();
+    const provider    = process.env.EMAIL_PROVIDER || settings.get('email_provider') || 'manual';
+    const hasResendKey= !!(process.env.RESEND_API_KEY || settings.get('resend_api_key'));
+    sendJSON(res, 200, { provider, hasResendKey, from: process.env.RESEND_FROM || settings.get('resend_from') || 'noreply@wavesfinancial.ca' });
+    return;
+  }
+
+  // ── POST /api/email/provider ──────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/email/provider') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { provider, resend_api_key, resend_from } = body;
+    if (!['manual','resend','leadfox'].includes(provider)) { sendJSON(res, 400, { error: 'Invalid provider' }); return; }
+    await settings.set('email_provider', provider);
+    if (resend_api_key) { await settings.set('resend_api_key', resend_api_key); process.env.RESEND_API_KEY = resend_api_key; }
+    if (resend_from)    { await settings.set('resend_from',    resend_from);    process.env.RESEND_FROM    = resend_from; }
+    process.env.EMAIL_PROVIDER = provider;
+    console.log('[email] Provider set to:', provider);
+    sendJSON(res, 200, { ok: true, provider });
+    return;
+  }
+
+  // ── GET /api/email/templates ──────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/email/templates') {
+    const { DEFAULTS } = require('./emailTemplates');
+    try {
+      const { data: dbTemplates } = await supabase.from('email_templates').select('event,subject,body_html,enabled,updated_at');
+      const templates = Object.entries(DEFAULTS).map(([event, def]) => {
+        const db = (dbTemplates||[]).find(t=>t.event===event);
+        return { event, subject:db?.subject||def.subject, body_html:db?.body_html||def.body_html, enabled:db?db.enabled:true, updated_at:db?.updated_at||null, is_default:!db };
+      });
+      sendJSON(res, 200, { templates });
+    } catch {
+      const { DEFAULTS: D2 } = require('./emailTemplates');
+      sendJSON(res, 200, { templates: Object.entries(D2).map(([event,def])=>({ event, subject:def.subject, body_html:def.body_html, enabled:true, is_default:true })) });
+    }
+    return;
+  }
+
+  // ── POST /api/email/templates/:event ─────────────────────────────────────────
+  if (req.method === 'POST' && req.url.startsWith('/api/email/templates/')) {
+    const event = req.url.split('/')[4];
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { subject, body_html, enabled } = body;
+    if (!subject || !body_html) { sendJSON(res, 400, { error: 'subject and body_html required' }); return; }
+    try {
+      await supabase.from('email_templates').upsert({ event, subject, body_html, enabled:enabled!==false, updated_at:new Date().toISOString() }, { onConflict:'event' });
+      sendJSON(res, 200, { ok:true, event });
+    } catch(err) { sendJSON(res, 500, { error:err.message }); }
+    return;
+  }
+
+  // ── POST /api/email/test ──────────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/email/test') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { to, event='loan_approved' } = body;
+    if (!to) { sendJSON(res, 400, { error: 'to email required' }); return; }
+    const testData = { first_name:'Test', last_name:'User', loan_ref:'WF-TEST01', loan_amount:'750.00', payment_amount:'103.54', payment_count:'8', first_payment:'May 1, 2026', fund_method:'Direct Deposit', apr:'23', nsf_fee:'45', due_date:'May 1, 2026' };
+    const result = await sendEmail({ event, to, data:testData, supabase });
+    sendJSON(res, result.ok?200:500, result);
+    return;
+  }
+
+  // ── GET /api/email/log ────────────────────────────────────────────────────────
+  if (req.method === 'GET' && req.url.startsWith('/api/email/log')) {
+    const urlObj   = new URL(req.url, 'http://localhost');
+    const clientId = urlObj.searchParams.get('clientId');
+    const limit    = parseInt(urlObj.searchParams.get('limit')||'50');
+    try {
+      let query = supabase.from('email_log').select('*').order('sent_at',{ascending:false}).limit(limit);
+      if (clientId) query = query.eq('client_id', clientId);
+      const { data, error } = await query;
+      if (error) throw error;
+      sendJSON(res, 200, { logs: data||[] });
+    } catch(err) { sendJSON(res, 500, { error:err.message }); }
+    return;
+  }
+
+  // ── GET /api/eft/etransfer ────────────────────────────────────────────────────
   // Generates Desjardins bulk Interac e-Transfer CSV for all
   // pending_disbursement loans where fund_method = 'etransfer'
   if (req.method === 'GET' && req.url.startsWith('/api/eft/etransfer') && !req.url.includes('/confirm')) {
@@ -878,6 +999,21 @@ async function handleRequest(req, res) {
       const count = updated?.length || 0;
       console.log(`[eft/etransfer/confirm] ${count} loans marked active by ${confirmedBy}`);
       sendJSON(res, 200, { ok: true, activated: count, loans: updated?.map(l => ({ id: l.id, ref: l.ref })) });
+
+      // Send disbursement_sent email for each activated loan (non-blocking)
+      for (const loan of (updated || [])) {
+        try {
+          const [clientRes, schedRes] = await Promise.all([
+            supabase.from('clients').select('email,first_name,last_name').eq('id', loan.client_id).single(),
+            supabase.from('repayment_schedule').select('due_date,scheduled_amount').eq('loan_id', loan.id).eq('status','scheduled').order('due_date',{ascending:true}).limit(1),
+          ]);
+          const cl = clientRes.data; const sc = schedRes.data?.[0];
+          if (cl?.email) {
+            await sendEmail({ event:'disbursement_sent', to:cl.email, clientId:loan.client_id, loanRef:loan.ref, supabase,
+              data:{ first_name:cl.first_name||'', loan_ref:loan.ref, loan_amount:loan.principal, payment_amount:sc?.scheduled_amount||'—', first_payment:sc?.due_date||'—', fund_method:'Interac e-Transfer', apr:Math.round((parseFloat(process.env.APR||'0.23'))*100) } });
+          }
+        } catch(emailErr) { console.warn('[eft/etransfer/confirm] Email failed (non-fatal):', emailErr.message); }
+      }
     } catch (err) {
       console.error('[eft/etransfer/confirm] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
@@ -1064,6 +1200,21 @@ async function handleRequest(req, res) {
       const count = updated?.length || 0;
       console.log(`[eft/drd/confirm] ${count} loans marked active by ${confirmedBy}`);
       sendJSON(res, 200, { ok: true, activated: count, loans: updated?.map(l => ({ id: l.id, ref: l.ref })) });
+
+      // Send disbursement_sent email for each activated loan (non-blocking)
+      for (const loan of (updated || [])) {
+        try {
+          const [clientRes, schedRes] = await Promise.all([
+            supabase.from('clients').select('email,first_name,last_name').eq('id', loan.client_id).single(),
+            supabase.from('repayment_schedule').select('due_date,scheduled_amount').eq('loan_id', loan.id).eq('status','scheduled').order('due_date',{ascending:true}).limit(1),
+          ]);
+          const cl = clientRes.data; const sc = schedRes.data?.[0];
+          if (cl?.email) {
+            await sendEmail({ event:'disbursement_sent', to:cl.email, clientId:loan.client_id, loanRef:loan.ref, supabase,
+              data:{ first_name:cl.first_name||'', loan_ref:loan.ref, loan_amount:loan.principal, payment_amount:sc?.scheduled_amount||'—', first_payment:sc?.due_date||'—', fund_method:'Direct Deposit', apr:Math.round((parseFloat(process.env.APR||'0.23'))*100) } });
+          }
+        } catch(emailErr) { console.warn('[eft/drd/confirm] Email failed (non-fatal):', emailErr.message); }
+      }
     } catch (err) {
       console.error('[eft/drd/confirm] Error:', err.message, err.stack?.split('\n')[1]);
       sendJSON(res, 500, { error: err.message });
