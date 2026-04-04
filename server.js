@@ -830,17 +830,29 @@ async function handleRequest(req, res) {
 
   // ── GET /api/email/templates ──────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/api/email/templates') {
-    const { DEFAULTS } = require('./emailTemplates');
+    const { DEFAULTS, VARIABLES } = require('./emailTemplates');
     try {
       const { data: dbTemplates } = await supabase.from('email_templates').select('event,subject,body_html,enabled,updated_at');
       const templates = Object.entries(DEFAULTS).map(([event, def]) => {
         const db = (dbTemplates||[]).find(t=>t.event===event);
-        return { event, subject:db?.subject||def.subject, body_html:db?.body_html||def.body_html, enabled:db?db.enabled:true, updated_at:db?.updated_at||null, is_default:!db };
+        return {
+          event,
+          label:      def.label,
+          audience:   def.audience,
+          subject:    db?.subject   || def.subject,
+          body_html:  db?.body_html || def.body_html,
+          enabled:    db ? db.enabled : def.enabled,
+          updated_at: db?.updated_at || null,
+          is_default: !db,
+        };
       });
-      sendJSON(res, 200, { templates });
+      sendJSON(res, 200, { templates, variables: VARIABLES });
     } catch {
-      const { DEFAULTS: D2 } = require('./emailTemplates');
-      sendJSON(res, 200, { templates: Object.entries(D2).map(([event,def])=>({ event, subject:def.subject, body_html:def.body_html, enabled:true, is_default:true })) });
+      const { DEFAULTS: D2, VARIABLES: V2 } = require('./emailTemplates');
+      sendJSON(res, 200, {
+        templates: Object.entries(D2).map(([event,def])=>({ event, label:def.label, audience:def.audience, subject:def.subject, body_html:def.body_html, enabled:def.enabled, is_default:true })),
+        variables: V2,
+      });
     }
     return;
   }
