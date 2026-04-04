@@ -104,15 +104,26 @@ function waitUntilLoaded() {
 module.exports = { load, get, set, getAll, getProcessor, getIBVProvider, isKYCEnabled, waitUntilLoaded, getLoanSettings };
 
 // ── LOAN SETTINGS HELPERS ─────────────────────────────────────────────────────
+const ALL_PROVINCES = ['BC','ON','NS','NB','PE','NL','AB','MB','SK','QC','YT','NT','NU'];
+const DEFAULT_SERVED = ['BC','ON','NS','NB','PE','NL'];
+
 function getLoanSettings() {
+  const rawProvinces = get('served_provinces');
+  const servedProvinces = rawProvinces
+    ? JSON.parse(rawProvinces)
+    : DEFAULT_SERVED;
   return {
-    minLoan:       parseFloat(get('min_loan')      || 500),
-    maxLoan:       parseFloat(get('max_loan')      || 1000),
-    apr:           parseFloat(get('apr')           || 0.23),
-    termDays:      parseInt(  get('term_days')     || 112),
-    paymentCount:  parseInt(  get('payment_count') || 8),
-    nsfFee:        parseFloat(get('nsf_fee')       || 45.00),
-    padCutoffTime: get('pad_cutoff_time')          || '14:30',
-    emailNotif:    get('email_notifications')      === 'true',
+    minLoan:        parseFloat(get('min_loan')      || 500),
+    maxLoan:        parseFloat(get('max_loan')      || 1000),
+    apr:            parseFloat(get('apr')           || 0.23),
+    termDays:       parseInt(  get('term_days')     || 112),
+    paymentCount:   parseInt(  get('payment_count') || 8),
+    nsfFee:         parseFloat(get('nsf_fee')       || 45.00),
+    padCutoffTime:  get('pad_cutoff_time')          || '14:30',
+    emailNotif:     get('email_notifications')      === 'true',
+    servedProvinces,
+    allProvinces:   ALL_PROVINCES,
   };
 }
+
+module.exports.DEFAULT_SERVED = DEFAULT_SERVED;

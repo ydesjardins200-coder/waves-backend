@@ -2139,6 +2139,11 @@ async function handleRequest(req, res) {
     for (const key of allowed) {
       if (body[key] !== undefined) await settings.set(key, String(body[key]));
     }
+    // served_provinces is an array — store as JSON
+    if (Array.isArray(body.served_provinces)) {
+      await settings.set('served_provinces', JSON.stringify(body.served_provinces));
+      console.log('[config] Served provinces updated:', body.served_provinces.join(', '));
+    }
     console.log('[config] Loan settings saved:', JSON.stringify(body));
     sendJSON(res, 200, { ok: true, settings: settings.getLoanSettings() });
     return;
