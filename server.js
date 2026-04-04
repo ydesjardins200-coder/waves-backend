@@ -419,9 +419,10 @@ async function handleRequest(req, res) {
         sendJSON(res, 400, { error: 'No valid approved amount on application' }); return;
       }
 
-      const APR           = 0.23;
-      const TERM_DAYS     = 112;
-      const PAYMENT_COUNT = 8;
+      const loanCfg      = settings.getLoanSettings();
+      const APR           = loanCfg.apr;
+      const TERM_DAYS     = loanCfg.termDays;
+      const PAYMENT_COUNT = loanCfg.paymentCount;
 
       // Optional fees — loaded from application record, spread across payments
       const optionalFees     = app.optional_fees ? JSON.parse(app.optional_fees) : [];
@@ -1723,9 +1724,10 @@ async function handleRequest(req, res) {
       const optionalFeesTotal = optionalFees.reduce((s, f) => s + parseFloat(f.fee || 0), 0);
 
       // Recalculate payment amount
-      const APR            = parseFloat(loan.apr || 0.23);
-      const termDays       = loan.term_days || 112;
-      const paymentCount   = loan.payment_count || 8;
+      const loanCfg2      = settings.getLoanSettings();
+      const APR            = parseFloat(loan.apr || loanCfg2.apr);
+      const termDays       = loan.term_days || loanCfg2.termDays;
+      const paymentCount   = loan.payment_count || loanCfg2.paymentCount;
       const principal      = parseFloat(loan.principal);
       const feePerPayment  = parseFloat((optionalFeesTotal / paymentCount).toFixed(2));
       const basePayment    = parseFloat(((principal * (1 + APR * termDays / 365)) / paymentCount).toFixed(2));
@@ -1769,6 +1771,26 @@ async function handleRequest(req, res) {
       console.error('[recalc-fees] Error:', err.message);
       sendJSON(res, 500, { error: err.message });
     }
+    return;
+  }
+
+  // ── GET /api/config/loan-settings ────────────────────────────────────────────
+  if (req.method === 'GET' && req.url === '/api/config/loan-settings') {
+    await settings.waitUntilLoaded();
+    sendJSON(res, 200, settings.getLoanSettings());
+    return;
+  }
+
+  // ── POST /api/config/loan-settings ───────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/api/config/loan-settings') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const allowed = ['min_loan','max_loan','apr','term_days','payment_count','nsf_fee','pad_cutoff_time','email_notifications'];
+    for (const key of allowed) {
+      if (body[key] !== undefined) await settings.set(key, String(body[key]));
+    }
+    console.log('[config] Loan settings saved:', JSON.stringify(body));
+    sendJSON(res, 200, { ok: true, settings: settings.getLoanSettings() });
     return;
   }
 
@@ -2116,7 +2138,7 @@ async function handleRequest(req, res) {
               await supabase.from('nsf_fees').insert({
                 client_id:   loan.client_id,
                 loan_id:     loan.id,
-                amount:      45.00,
+                amount:      settings.getLoanSettings().nsfFee,
                 reason:      event.returnMsg || 'NSF via VoPay',
                 return_code: event.returnCode,
                 status:      'outstanding',

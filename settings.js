@@ -101,4 +101,18 @@ function waitUntilLoaded() {
   });
 }
 
-module.exports = { load, get, set, getAll, getProcessor, getIBVProvider, isKYCEnabled, waitUntilLoaded };
+module.exports = { load, get, set, getAll, getProcessor, getIBVProvider, isKYCEnabled, waitUntilLoaded, getLoanSettings };
+
+// ── LOAN SETTINGS HELPERS ─────────────────────────────────────────────────────
+function getLoanSettings() {
+  return {
+    minLoan:       parseFloat(get('min_loan')      || 500),
+    maxLoan:       parseFloat(get('max_loan')      || 1000),
+    apr:           parseFloat(get('apr')           || 0.23),
+    termDays:      parseInt(  get('term_days')     || 112),
+    paymentCount:  parseInt(  get('payment_count') || 8),
+    nsfFee:        parseFloat(get('nsf_fee')       || 45.00),
+    padCutoffTime: get('pad_cutoff_time')          || '14:30',
+    emailNotif:    get('email_notifications')      === 'true',
+  };
+}
