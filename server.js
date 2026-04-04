@@ -1,5 +1,19 @@
 'use strict';
 
+// ── OPTIONAL FEE CALCULATOR ───────────────────────────────────────────────────
+function calcOptionalFeesTotal(fees, loanAmount) {
+  return fees.reduce((sum, f) => {
+    const type = f.fee_type || 'flat';
+    const flat = parseFloat(f.fee  || 0);
+    const pct  = parseFloat(f.pct  || 0);
+    if (type === 'flat')       return sum + flat;
+    if (type === 'percentage') return sum + (loanAmount * pct / 100);
+    if (type === 'both')       return sum + flat + (loanAmount * pct / 100);
+    return sum + flat; // fallback
+  }, 0);
+}
+
+
 /**
  * Waves Financial — Backend Server
  *
@@ -428,7 +442,7 @@ async function handleRequest(req, res) {
 
       // Optional fees — loaded from application record, spread across payments
       const optionalFees     = app.optional_fees ? JSON.parse(app.optional_fees) : [];
-      const optionalFeesTotal = optionalFees.reduce((s, f) => s + parseFloat(f.fee || 0), 0);
+      const optionalFeesTotal = calcOptionalFeesTotal(optionalFees, approvedAmount);
       const feePerPayment    = parseFloat((optionalFeesTotal / PAYMENT_COUNT).toFixed(2));
 
       const paymentAmt     = parseFloat(((approvedAmount * (1 + APR * TERM_DAYS / 365)) / PAYMENT_COUNT).toFixed(2)) + feePerPayment;
@@ -2047,7 +2061,7 @@ async function handleRequest(req, res) {
 
       const optionalFees      = (app?.optional_fees && app.optional_fees !== 'null')
         ? JSON.parse(app.optional_fees) : [];
-      const optionalFeesTotal = optionalFees.reduce((s, f) => s + parseFloat(f.fee || 0), 0);
+      const optionalFeesTotal = calcOptionalFeesTotal(optionalFees, approvedAmount);
 
       // Recalculate payment amount
       const loanCfg2      = settings.getLoanSettings();
