@@ -1981,6 +1981,48 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── POST /api/loans/:loanId/status ───────────────────────────────────────────
+  // Manually update loan status (paid_off, defaulted, cancelled, active)
+  if (req.method === 'POST' && req.url.match(/^\/api\/loans\/[^/]+\/status$/)) {
+    const loanId = req.url.split('/')[3];
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON' }); return; }
+    const { status, note = '', confirmedBy = 'analyst' } = body;
+    const allowed = ['paid_off','defaulted','cancelled','active'];
+    if (!allowed.includes(status)) { sendJSON(res, 400, { error: `status must be one of: ${allowed.join(', ')}` }); return; }
+    try {
+      const { data: loan, error: fetchErr } = await supabase.from('loans').select('id,ref,principal,client_id,status').eq('id', loanId).single();
+      if (fetchErr || !loan) { sendJSON(res, 404, { error: 'Loan not found' }); return; }
+
+      const now = new Date().toISOString();
+      const update = { status };
+      if (status === 'paid_off') update.disbursed_at = update.disbursed_at || now;
+
+      await supabase.from('loans').update(update).eq('id', loanId);
+
+      // Log note
+      const defaultNote = {
+        paid_off:  `Loan ${loan.ref} manually marked as paid off by ${confirmedBy}.`,
+        defaulted: `Loan ${loan.ref} marked as defaulted by ${confirmedBy}.`,
+        cancelled: `Loan ${loan.ref} cancelled by ${confirmedBy}.`,
+        active:    `Loan ${loan.ref} reinstated to active by ${confirmedBy}.`,
+      }[status] || `Loan ${loan.ref} status changed to ${status} by ${confirmedBy}.`;
+
+      await supabase.from('client_notes').insert({
+        client_id: loan.client_id,
+        agent:     confirmedBy,
+        note:      note ? `${defaultNote} Note: ${note}` : defaultNote,
+        context:   status,
+      }).then(()=>{},()=>{});
+
+      console.log(`[loans/status] ${loan.ref} → ${status} by ${confirmedBy}`);
+      sendJSON(res, 200, { ok: true, loanId, ref: loan.ref, status });
+    } catch(err) {
+      sendJSON(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   // ── POST /api/loans/:loanId/recalc-fees ──────────────────────────────────────
   // Recalculates scheduled_amount on all schedule rows to include optional fees
   // Used when a loan was approved before optional fees were wired into the calc
